@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --- Library: all real logic lives here so tests can link against it ---
 add_library(emberdb_lib
     src/store.cpp
+    src/resp_parser.cpp
 )
 target_include_directories(emberdb_lib PUBLIC include)
 target_compile_options(emberdb_lib PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
