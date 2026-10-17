@@ -151,3 +151,15 @@ TEST_F(ServerTest, LargeValueRoundTripExercisesPartialWrites) {
     const std::string expected = "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
     EXPECT_TRUE(recv_n(c.fd(), expected.size()) == expected);
 }
+
+TEST_F(ServerTest, KeyExpiresInRealTime) {
+    emberdb::Socket c(dial(port_));
+    ASSERT_TRUE(c.valid());
+    send_all(c.fd(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    EXPECT_EQ(recv_n(c.fd(), 5), "+OK\r\n");
+    send_all(c.fd(), "*3\r\n$7\r\nPEXPIRE\r\n$1\r\nk\r\n$2\r\n50\r\n");
+    EXPECT_EQ(recv_n(c.fd(), 4), ":1\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    send_all(c.fd(), "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    EXPECT_EQ(recv_n(c.fd(), 5), "$-1\r\n");
+}

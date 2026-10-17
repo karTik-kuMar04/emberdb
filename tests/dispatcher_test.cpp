@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "emberdb/dispatcher.hpp"
+#include "fake_clock.hpp"
 
 using emberdb::Command;
 using emberdb::execute;
@@ -57,4 +58,75 @@ TEST(Dispatcher, ErrorRepliesCannotInjectProtocolLines) {
     Store s;
     // The CR/LF inside the command name must not appear in the reply.
     EXPECT_EQ(execute(s, {"BAD\r\n+OK"}), "-ERR unknown command 'BAD  +OK'\r\n");
+}
+
+TEST(DispatcherExpiry, ExpireAndTtlCountDown) {
+    FakeClock clk;
+    Store s(clk.fn());
+    execute(s, {"SET", "k", "v"});
+    EXPECT_EQ(execute(s, {"TTL", "k"}), ":-1\r\n");
+    EXPECT_EQ(execute(s, {"EXPIRE", "k", "10"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"TTL", "k"}), ":10\r\n");
+    clk.now += 4000;
+    EXPECT_EQ(execute(s, {"TTL", "k"}), ":6\r\n");
+    EXPECT_EQ(execute(s, {"PTTL", "k"}), ":6000\r\n");
+    clk.now += 6000;
+    EXPECT_EQ(execute(s, {"GET", "k"}), "$-1\r\n");
+    EXPECT_EQ(execute(s, {"TTL", "k"}), ":-2\r\n");
+}
+
+TEST(DispatcherExpiry, ExpireOnMissingKeyReturnsZero) {
+    Store s;
+    EXPECT_EQ(execute(s, {"EXPIRE", "nope", "10"}), ":0\r\n");
+}
+
+TEST(DispatcherExpiry, ExpireRejectsBadArguments) {
+    Store s;
+    execute(s, {"SET", "k", "v"});
+    EXPECT_EQ(execute(s, {"EXPIRE", "k", "abc"}),
+              "-ERR value is not an integer or out of range\r\n");
+    EXPECT_EQ(execute(s, {"EXPIRE", "k", "1.5"}),
+              "-ERR value is not an integer or out of range\r\n");
+    EXPECT_EQ(execute(s, {"EXPIRE", "k", "9223372036854775807"}),
+              "-ERR invalid expire time in 'expire' command\r\n");
+}
+
+TEST(DispatcherExpiry, PersistRemovesTtl) {
+    FakeClock clk;
+    Store s(clk.fn());
+    execute(s, {"SET", "k", "v"});
+    execute(s, {"EXPIRE", "k", "10"});
+    EXPECT_EQ(execute(s, {"PERSIST", "k"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"TTL", "k"}), ":-1\r\n");
+    EXPECT_EQ(execute(s, {"PERSIST", "k"}), ":0\r\n");
+    EXPECT_EQ(execute(s, {"PERSIST", "nokey"}), ":0\r\n");
+}
+
+TEST(DispatcherExpiry, ExistsCountsLiveKeys) {
+    FakeClock clk;
+    Store s(clk.fn());
+    execute(s, {"SET", "a", "1"});
+    execute(s, {"SET", "b", "2"});
+    EXPECT_EQ(execute(s, {"EXISTS", "a", "b", "missing"}), ":2\r\n");
+    EXPECT_EQ(execute(s, {"EXISTS", "a", "a"}), ":2\r\n");
+    execute(s, {"EXPIRE", "a", "1"});
+    clk.now += 1000;
+    EXPECT_EQ(execute(s, {"EXISTS", "a"}), ":0\r\n");
+}
+
+TEST(DispatcherCounters, IncrAndDecr) {
+    Store s;
+    EXPECT_EQ(execute(s, {"INCR", "n"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"INCR", "n"}), ":2\r\n");
+    EXPECT_EQ(execute(s, {"DECR", "n"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"GET", "n"}), "$1\r\n1\r\n");
+}
+
+TEST(DispatcherCounters, IncrErrors) {
+    Store s;
+    execute(s, {"SET", "s", "abc"});
+    EXPECT_EQ(execute(s, {"INCR", "s"}), "-ERR value is not an integer or out of range\r\n");
+    execute(s, {"SET", "big", "9223372036854775807"});
+    EXPECT_EQ(execute(s, {"INCR", "big"}), "-ERR increment or decrement would overflow\r\n");
+    EXPECT_EQ(execute(s, {"INCR"}), "-ERR wrong number of arguments for 'INCR' command\r\n");
 }
