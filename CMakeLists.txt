@@ -12,15 +12,19 @@ add_library(emberdb_lib
     src/resp_parser.cpp
     src/resp_writer.cpp
     src/dispatcher.cpp
-    src/server.cpp
 )
 target_include_directories(emberdb_lib PUBLIC include)
 target_compile_options(emberdb_lib PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)
 
-# --- Executable: a thin wrapper around the library ---
-add_executable(emberdb src/main.cpp)
-target_link_libraries(emberdb PRIVATE emberdb_lib)
-target_compile_options(emberdb PRIVATE -Wall -Wextra -Wpedantic)
+# --- Server + executable: epoll is Linux-only ---
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(emberdb_lib PRIVATE src/server.cpp)
+    add_executable(emberdb src/main.cpp)
+    target_link_libraries(emberdb PRIVATE emberdb_lib)
+    target_compile_options(emberdb PRIVATE -Wall -Wextra -Wpedantic)
+else()
+    message(STATUS "Server needs epoll (Linux): building core library and tests only")
+endif()
 
 # --- Tests ---
 enable_testing()
