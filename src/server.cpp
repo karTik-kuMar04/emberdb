@@ -22,6 +22,7 @@ namespace {
 constexpr int kBacklog = 511;
 constexpr std::size_t kMaxClients = 10000;
 constexpr int kEpollTimeoutMs = 1000;  // wake up now and then to notice stop()
+constexpr std::size_t kPurgeBudget = 1000;    // max keys deleted per sweep
 constexpr std::size_t kMaxInputBytes = 64UL * 1024 * 1024;
 constexpr std::size_t kMaxOutputBytes = 64UL * 1024 * 1024;
 constexpr std::size_t kOutputHighWater = 1UL * 1024 * 1024;
@@ -83,9 +84,10 @@ Server::Server(Store& store, std::uint16_t port) : store_(store) {
 
 void Server::run() {
     std::array<epoll_event, 128> events{};
+    int timeout_ms = kEpollTimeoutMs;
     while (!stopping_.load()) {
         const int n =
-            ::epoll_wait(epoll_.fd(), events.data(), static_cast<int>(events.size()), kEpollTimeoutMs);
+            ::epoll_wait(epoll_.fd(), events.data(), static_cast<int>(events.size()), timeout_ms);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -100,6 +102,11 @@ void Server::run() {
                 handle_event(ev.data.fd, ev.events);
             }
         }
+
+        // Active expiry: delete a bounded batch of due keys. If the batch was full there is
+        // probably more due, so come back immediately instead of sleeping.
+        const std::size_t removed = store_.purge_expired(kPurgeBudget);
+        timeout_ms = (removed == kPurgeBudget) ? 0 : kEpollTimeoutMs;
     }
 }
 
