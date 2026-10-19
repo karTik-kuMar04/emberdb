@@ -38,6 +38,9 @@ Store::Entry* Store::find_live(const std::string& key, std::int64_t now) {
     }
     Entry& entry = it->second;
     if (!loading_ && entry.expire_at && *entry.expire_at <= now) {
+        if (passive_expiry_) {
+            return nullptr;  // follower: hide the key, but wait for the leader's DEL
+        }
         erase_entry(it, true);  // lazy expiry: the deadline passed, so the key is gone
         return nullptr;
     }
@@ -63,13 +66,19 @@ bool Store::del(const std::string& key) {
     if (it == data_.end()) {
         return false;
     }
-    const bool expired = !loading_ && it->second.expire_at && *it->second.expire_at <= clock_();
+    const bool expired =
+        !loading_ && !passive_expiry_ && it->second.expire_at && *it->second.expire_at <= clock_();
     erase_entry(it, expired);
     return !expired;
 }
 
 bool Store::exists(const std::string& key) {
     return find_live(key, clock_()) != nullptr;
+}
+
+void Store::clear() {
+    data_.clear();
+    expirations_.clear();
 }
 
 std::size_t Store::size() const noexcept {
@@ -86,7 +95,7 @@ ExpireResult Store::expire_at(const std::string& key, std::int64_t at_ms) {
     if (entry == nullptr) {
         return ExpireResult::kNoSuchKey;
     }
-    if (!loading_ && at_ms <= now) {
+    if (!loading_ && !passive_expiry_ && at_ms <= now) {
         del(key);
         return ExpireResult::kKeyDeleted;
     }
@@ -105,7 +114,7 @@ long long Store::ttl_ms(const std::string& key) {
     if (!entry->expire_at) {
         return -1;
     }
-    return *entry->expire_at - now;  // always > 0 here: find_live removed expired keys
+    return *entry->expire_at - now;  // always > 0 here: find_live removed or hid expired keys
 }
 
 bool Store::persist(const std::string& key) {
@@ -118,6 +127,9 @@ bool Store::persist(const std::string& key) {
 }
 
 std::size_t Store::purge_expired(std::size_t max_keys) {
+    if (passive_expiry_) {
+        return 0;  // a follower waits for the leader to say which keys are gone
+    }
     const std::int64_t now = clock_();
     std::size_t removed = 0;
     while (removed < max_keys && !expirations_.empty()) {

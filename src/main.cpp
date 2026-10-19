@@ -4,6 +4,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -27,6 +28,8 @@ struct Options {
     std::string aof_path;  // empty = persistence off
     emberdb::Aof::Fsync fsync = emberdb::Aof::Fsync::kEverySecond;
     std::size_t aof_rewrite_min_bytes = 64UL * 1024 * 1024;
+    std::string leader_host;  // empty = run as a leader
+    std::uint16_t leader_port = 0;
 };
 
 bool parse_args(int argc, char** argv, Options& opts) {
@@ -56,6 +59,17 @@ bool parse_args(int argc, char** argv, Options& opts) {
                 return false;
             }
             opts.aof_rewrite_min_bytes = static_cast<std::size_t>(*bytes);
+        } else if (flag == "--replicaof") {
+            const auto colon = value.rfind(':');
+            if (colon == std::string_view::npos || colon == 0) {
+                return false;
+            }
+            const auto port = emberdb::parse_int64(value.substr(colon + 1));
+            if (!port || *port < 1 || *port > 65535) {
+                return false;
+            }
+            opts.leader_host = std::string(value.substr(0, colon));
+            opts.leader_port = static_cast<std::uint16_t>(*port);
         } else {
             return false;
         }
@@ -69,7 +83,7 @@ int main(int argc, char** argv) {
     Options opts;
     if (!parse_args(argc, argv, opts)) {
         std::cerr << "usage: emberdb [--port N] [--aof PATH] [--fsync always|everysec|no]\n"
-                     "               [--aof-rewrite-min-bytes N]\n";
+                     "               [--aof-rewrite-min-bytes N] [--replicaof HOST:PORT]\n";
         return 1;
     }
 
@@ -94,6 +108,14 @@ int main(int argc, char** argv) {
         }
         emberdb::Server server(store, opts.port, aof.get());
         g_server = &server;
+
+        if (!opts.leader_host.empty()) {
+            const std::string error = server.replicate_from(opts.leader_host, opts.leader_port);
+            if (!error.empty()) {
+                throw std::runtime_error("--replicaof: " + error);
+            }
+            std::cout << "following " << opts.leader_host << ":" << opts.leader_port << std::endl;
+        }
 
         struct sigaction sa{};
         sa.sa_handler = on_signal;

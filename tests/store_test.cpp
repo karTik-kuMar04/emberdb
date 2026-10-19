@@ -218,3 +218,53 @@ TEST(StoreExpireAt, ReportsWhatHappened) {
     EXPECT_EQ(s.expire_at("a", 1000), emberdb::ExpireResult::kKeyDeleted);
     EXPECT_FALSE(s.exists("a"));
 }
+
+TEST(StorePassive, ExpiredKeysAreHiddenButNotDeleted) {
+    FakeClock clk;
+    emberdb::Store s(clk.fn());
+    s.set("a", "1");
+    s.expire_in("a", 10);
+    s.set_passive_expiry(true);
+    clk.now += 10;
+    EXPECT_FALSE(s.get("a").has_value());
+    EXPECT_FALSE(s.exists("a"));
+    EXPECT_EQ(s.ttl_ms("a"), -2);
+    EXPECT_EQ(s.size(), 1U);             // still in memory
+    EXPECT_EQ(s.purge_expired(10), 0U);  // and the sweep leaves it alone
+    EXPECT_TRUE(s.del("a"));             // only the leader's DEL removes it
+    EXPECT_EQ(s.size(), 0U);
+}
+
+TEST(StorePassive, PastDeadlineFromLeaderIsStoredNotApplied) {
+    FakeClock clk;  // starts at 1000
+    emberdb::Store s(clk.fn());
+    s.set_passive_expiry(true);
+    s.set("a", "1");
+    EXPECT_EQ(s.expire_at("a", 500), emberdb::ExpireResult::kDeadlineSet);  // already in the past
+    EXPECT_EQ(s.size(), 1U);
+    EXPECT_FALSE(s.get("a").has_value());
+}
+
+TEST(StorePassive, LeavingPassiveModeResumesNormalExpiry) {
+    FakeClock clk;
+    emberdb::Store s(clk.fn());
+    s.set_passive_expiry(true);
+    s.set("a", "1");
+    s.expire_in("a", 10);
+    clk.now += 10;
+    s.set_passive_expiry(false);
+    EXPECT_EQ(s.purge_expired(10), 1U);
+    EXPECT_EQ(s.size(), 0U);
+}
+
+TEST(StoreClear, RemovesKeysAndDeadlines) {
+    FakeClock clk;
+    emberdb::Store s(clk.fn());
+    s.set("a", "1");
+    s.expire_in("a", 100);
+    s.set("b", "2");
+    s.clear();
+    EXPECT_EQ(s.size(), 0U);
+    EXPECT_EQ(s.purge_expired(10), 0U);
+    EXPECT_FALSE(s.exists("a"));
+}
