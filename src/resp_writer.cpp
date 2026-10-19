@@ -1,10 +1,8 @@
 #include "emberdb/resp_writer.hpp"
-#include <string>
-#include <string_view>
 
 namespace emberdb::resp {
-std::string simple_string(std::string_view s) {
 
+std::string simple_string(std::string_view s) {
     std::string out;
     out.reserve(s.size() + 3);
     out += '+';
@@ -16,12 +14,12 @@ std::string simple_string(std::string_view s) {
 std::string error(std::string_view msg) {
     std::string out = "-ERR ";
     out.reserve(msg.size() + 8);
-    for (char ch : msg) {
+    for (char c : msg) {
         // A raw CR/LF would end the reply early and let a client inject
         // fake protocol lines, so we neutralize them.
-        out += (ch == '\r' || ch == '\n') ? ' ' : ch;
+        out += (c == '\r' || c == '\n') ? ' ' : c;
     }
-    out +="\r\n";
+    out += "\r\n";
     return out;
 }
 
@@ -40,4 +38,16 @@ std::string null_bulk() {
     return "$-1\r\n";
 }
 
-} // namespace emberdb::resp
+std::string command(const std::vector<std::string>& parts) {
+    std::string out = "*" + std::to_string(parts.size()) + "\r\n";
+    for (const std::string& part : parts) {
+        out += '$';
+        out += std::to_string(part.size());
+        out += "\r\n";
+        out += part;
+        out += "\r\n";
+    }
+    return out;
+}
+
+}  // namespace emberdb::resp

@@ -8,12 +8,13 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace emberdb {
 
-// Milliseconds on a monotonic clock. Injected so tests can control time.
+// Milliseconds since the Unix epoch. Injected so tests can control time.
 using Clock = std::function<std::int64_t()>;
-std::int64_t steady_now_ms();
+std::int64_t unix_now_ms();
 
 struct IncrResult {
     enum class Status { kOk, kNotInteger, kOverflow };
@@ -21,9 +22,11 @@ struct IncrResult {
     long long value = 0;
 };
 
+enum class ExpireResult { kNoSuchKey, kDeadlineSet, kKeyDeleted };
+
 class Store {
 public:
-    explicit Store(Clock clock = steady_now_ms);
+    explicit Store(Clock clock = unix_now_ms);
 
     void set(const std::string& key, std::string value);  // like Redis SET: clears any TTL
     std::optional<std::string> get(const std::string& key);
@@ -32,11 +35,14 @@ public:
 
     // Counts keys not yet purged, so it can include expired ones.
     [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] std::int64_t now_ms() const { return clock_(); }
 
     // --- expiry ---
-    // Sets a deadline `ms` from now. Returns false if the key doesn't exist.
-    // ms <= 0 deletes the key immediately (and returns true), as Redis does.
+    // Deadline relative to now. Returns false if the key doesn't exist.
     bool expire_in(const std::string& key, long long ms);
+    // Deadline as an absolute time. A time that is not in the future deletes the key
+    // (except while loading, see set_loading).
+    ExpireResult expire_at(const std::string& key, std::int64_t at_ms);
     // Remaining milliseconds; -2 if the key doesn't exist, -1 if it has no deadline.
     long long ttl_ms(const std::string& key);
     bool persist(const std::string& key);  // removes the deadline; true if one existed
@@ -46,19 +52,32 @@ public:
     // --- counters ---
     IncrResult incr_by(const std::string& key, long long delta);
 
+    // --- persistence support ---
+    // While loading (AOF replay) nothing expires and past deadlines are stored as-is,
+    // because replay runs later than the commands originally did.
+    void set_loading(bool on) noexcept { loading_ = on; }
+    // When on, keys removed by expiry are remembered so the server can log them as DEL.
+    void set_track_expired(bool on) noexcept { track_expired_ = on; }
+    std::vector<std::string> take_expired();
+
 private:
     struct Entry {
         std::string value;
         std::optional<std::int64_t> expire_at;  // absolute time in clock milliseconds
     };
+    using Map = std::unordered_map<std::string, Entry>;
 
     Entry* find_live(const std::string& key, std::int64_t now);  // deletes the key if expired
     void drop_expiry(const std::string& key, Entry& entry);
+    void erase_entry(Map::iterator it, bool expired);
 
     Clock clock_;
-    std::unordered_map<std::string, Entry> data_;
+    Map data_;
     // (deadline, key) pairs sorted by deadline: the front is always the next key to expire.
     std::set<std::pair<std::int64_t, std::string>> expirations_;
+    std::vector<std::string> expired_log_;
+    bool loading_ = false;
+    bool track_expired_ = false;
 };
 
 }  // namespace emberdb

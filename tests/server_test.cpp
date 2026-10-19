@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include "emberdb/aof.hpp"
 #include "emberdb/server.hpp"
 
 namespace {
@@ -162,4 +164,38 @@ TEST_F(ServerTest, KeyExpiresInRealTime) {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     send_all(c.fd(), "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
     EXPECT_EQ(recv_n(c.fd(), 5), "$-1\r\n");
+}
+
+TEST(ServerPersistence, DataSurvivesRestart) {
+    char tpl[] = "/tmp/emberdb_srv_XXXXXX";
+    const int tmp_fd = ::mkstemp(tpl);
+    ASSERT_GE(tmp_fd, 0);
+    ::close(tmp_fd);
+    const std::string path = tpl;
+
+    {
+        emberdb::Store store;
+        auto aof = emberdb::Aof::open(path, emberdb::Aof::Fsync::kAlways, store);
+        emberdb::Server server(store, 0, aof.get());
+        std::thread t([&] { server.run(); });
+        emberdb::Socket c(dial(server.port()));
+        ASSERT_TRUE(c.valid());
+        send_all(c.fd(), "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nember\r\n");
+        EXPECT_EQ(recv_n(c.fd(), 5), "+OK\r\n");
+        server.stop();
+        t.join();
+    }
+    {
+        emberdb::Store store;
+        auto aof = emberdb::Aof::open(path, emberdb::Aof::Fsync::kAlways, store);
+        emberdb::Server server(store, 0, aof.get());
+        std::thread t([&] { server.run(); });
+        emberdb::Socket c(dial(server.port()));
+        ASSERT_TRUE(c.valid());
+        send_all(c.fd(), "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n");
+        EXPECT_EQ(recv_n(c.fd(), 11), "$5\r\nember\r\n");
+        server.stop();
+        t.join();
+    }
+    ::unlink(path.c_str());
 }

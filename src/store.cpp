@@ -1,20 +1,35 @@
 #include "emberdb/store.hpp"
 
 #include <chrono>
-#include <limits>
 
 #include "emberdb/int_parse.hpp"
 
 namespace emberdb {
 
-std::int64_t steady_now_ms() {
+std::int64_t unix_now_ms() {
     using std::chrono::duration_cast;
     using std::chrono::milliseconds;
-    using std::chrono::steady_clock;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    using std::chrono::system_clock;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 Store::Store(Clock clock) : clock_(std::move(clock)) {}
+
+void Store::drop_expiry(const std::string& key, Entry& entry) {
+    if (entry.expire_at) {
+        expirations_.erase(std::make_pair(*entry.expire_at, key));
+        entry.expire_at.reset();
+    }
+}
+
+// The one place a key is removed. `expired` says it died of old age rather than by command.
+void Store::erase_entry(Map::iterator it, bool expired) {
+    if (expired && track_expired_) {
+        expired_log_.push_back(it->first);
+    }
+    drop_expiry(it->first, it->second);
+    data_.erase(it);
+}
 
 Store::Entry* Store::find_live(const std::string& key, std::int64_t now) {
     const auto it = data_.find(key);
@@ -22,19 +37,11 @@ Store::Entry* Store::find_live(const std::string& key, std::int64_t now) {
         return nullptr;
     }
     Entry& entry = it->second;
-    if (entry.expire_at && *entry.expire_at <= now) {
-        drop_expiry(key, entry);  // lazy expiry: the deadline passed, so the key is gone
-        data_.erase(it);
+    if (!loading_ && entry.expire_at && *entry.expire_at <= now) {
+        erase_entry(it, true);  // lazy expiry: the deadline passed, so the key is gone
         return nullptr;
     }
     return &entry;
-}
-
-void Store::drop_expiry(const std::string& key, Entry& entry) {
-    if (entry.expire_at) {
-        expirations_.erase(std::make_pair(*entry.expire_at, key));
-        entry.expire_at.reset();
-    }
 }
 
 void Store::set(const std::string& key, std::string value) {
@@ -56,10 +63,9 @@ bool Store::del(const std::string& key) {
     if (it == data_.end()) {
         return false;
     }
-    const bool was_live = !(it->second.expire_at && *it->second.expire_at <= clock_());
-    drop_expiry(key, it->second);
-    data_.erase(it);
-    return was_live;
+    const bool expired = !loading_ && it->second.expire_at && *it->second.expire_at <= clock_();
+    erase_entry(it, expired);
+    return !expired;
 }
 
 bool Store::exists(const std::string& key) {
@@ -71,21 +77,23 @@ std::size_t Store::size() const noexcept {
 }
 
 bool Store::expire_in(const std::string& key, long long ms) {
+    return expire_at(key, saturating_add(clock_(), ms)) != ExpireResult::kNoSuchKey;
+}
+
+ExpireResult Store::expire_at(const std::string& key, std::int64_t at_ms) {
     const std::int64_t now = clock_();
     Entry* entry = find_live(key, now);
     if (entry == nullptr) {
-        return false;
+        return ExpireResult::kNoSuchKey;
     }
-    if (ms <= 0) {
+    if (!loading_ && at_ms <= now) {
         del(key);
-        return true;
+        return ExpireResult::kKeyDeleted;
     }
-    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
-    const std::int64_t deadline = (ms > kMax - now) ? kMax : now + static_cast<std::int64_t>(ms);
     drop_expiry(key, *entry);
-    entry->expire_at = deadline;
-    expirations_.emplace(deadline, key);
-    return true;
+    entry->expire_at = at_ms;
+    expirations_.emplace(at_ms, key);
+    return ExpireResult::kDeadlineSet;
 }
 
 long long Store::ttl_ms(const std::string& key) {
@@ -117,8 +125,13 @@ std::size_t Store::purge_expired(std::size_t max_keys) {
         if (first->first > now) {
             break;  // the soonest deadline is still in the future, so nothing else is due
         }
-        data_.erase(first->second);
-        expirations_.erase(first);
+        const std::string key = first->second;  // copy: erasing below invalidates `first`
+        const auto it = data_.find(key);
+        if (it == data_.end()) {
+            expirations_.erase(first);  // defensive: index and map should never disagree
+            continue;
+        }
+        erase_entry(it, true);
         ++removed;
     }
     return removed;
@@ -143,6 +156,12 @@ IncrResult Store::incr_by(const std::string& key, long long delta) {
     }
     entry->value = std::to_string(next);  // an existing deadline is kept
     return {IncrResult::Status::kOk, next};
+}
+
+std::vector<std::string> Store::take_expired() {
+    std::vector<std::string> out;
+    out.swap(expired_log_);
+    return out;
 }
 
 }  // namespace emberdb

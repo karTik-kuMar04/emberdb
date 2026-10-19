@@ -8,6 +8,8 @@
 namespace emberdb {
 
 // Runs one parsed command against the store and returns the RESP reply bytes.
-    std::string execute(Store& store, const Command& command);
-} // namespace emberdb
+// If `propagate` is given, it is set to the command that should be appended to the AOF
+// (possibly rewritten, e.g. EXPIRE -> PEXPIREAT), or left empty if nothing changed.
+std::string execute(Store& store, const Command& command, Command* propagate = nullptr);
 
+}  // namespace emberdb

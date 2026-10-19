@@ -12,7 +12,8 @@
 namespace emberdb {
 namespace {
 
-using Handler = std::string (*)(Store&, const Command&);
+// `log` is filled only when the command changed state, with the form that replays correctly.
+using Handler = std::string (*)(Store&, const Command&, Command& log);
 
 struct CommandSpec {
     Handler handler;
@@ -36,16 +37,17 @@ bool arity_ok(int arity, std::size_t argc) {
 
 // --- Handlers: arity is already validated, so indexing is safe ---
 
-std::string cmd_ping(Store&, const Command&) {
+std::string cmd_ping(Store&, const Command&, Command&) {
     return resp::simple_string("PONG");
 }
 
-std::string cmd_set(Store& store, const Command& cmd) {
+std::string cmd_set(Store& store, const Command& cmd, Command& log) {
     store.set(cmd[1], cmd[2]);
+    log = cmd;
     return resp::simple_string("OK");
 }
 
-std::string cmd_get(Store& store, const Command& cmd) {
+std::string cmd_get(Store& store, const Command& cmd, Command&) {
     auto value = store.get(cmd[1]);
     if (!value) {
         return resp::null_bulk();
@@ -53,17 +55,20 @@ std::string cmd_get(Store& store, const Command& cmd) {
     return resp::bulk_string(*value);
 }
 
-std::string cmd_del(Store& store, const Command& cmd) {
+std::string cmd_del(Store& store, const Command& cmd, Command& log) {
     long long removed = 0;
     for (std::size_t i = 1; i < cmd.size(); ++i) {
         if (store.del(cmd[i])) {
             ++removed;
         }
     }
+    if (removed > 0) {
+        log = cmd;
+    }
     return resp::integer(removed);
 }
 
-std::string cmd_exists(Store& store, const Command& cmd) {
+std::string cmd_exists(Store& store, const Command& cmd, Command&) {
     long long found = 0;
     for (std::size_t i = 1; i < cmd.size(); ++i) {
         if (store.exists(cmd[i])) {
@@ -73,9 +78,25 @@ std::string cmd_exists(Store& store, const Command& cmd) {
     return resp::integer(found);
 }
 
+// Shared tail of EXPIRE, PEXPIRE and PEXPIREAT. The log always records an absolute time,
+// or a DEL when the deadline was already past.
+std::string apply_expire_at(Store& store, const std::string& key, long long at_ms, Command& log) {
+    switch (store.expire_at(key, at_ms)) {
+        case ExpireResult::kNoSuchKey:
+            return resp::integer(0);
+        case ExpireResult::kDeadlineSet:
+            log = Command{"PEXPIREAT", key, std::to_string(at_ms)};
+            return resp::integer(1);
+        case ExpireResult::kKeyDeleted:
+            log = Command{"DEL", key};
+            return resp::integer(1);
+    }
+    return resp::error("internal error");
+}
+
 // Shared by EXPIRE (unit = 1000 ms) and PEXPIRE (unit = 1 ms).
-std::string expire_with_unit(Store& store, const Command& cmd, long long unit_ms,
-                             const char* name) {
+std::string expire_relative(Store& store, const Command& cmd, long long unit_ms, const char* name,
+                            Command& log) {
     const auto amount = parse_int64(cmd[2]);
     if (!amount) {
         return resp::error(kNotInteger);
@@ -84,18 +105,26 @@ std::string expire_with_unit(Store& store, const Command& cmd, long long unit_ms
     if (__builtin_mul_overflow(*amount, unit_ms, &ms)) {
         return resp::error(std::string("invalid expire time in '") + name + "' command");
     }
-    return resp::integer(store.expire_in(cmd[1], ms) ? 1 : 0);
+    return apply_expire_at(store, cmd[1], saturating_add(store.now_ms(), ms), log);
 }
 
-std::string cmd_expire(Store& store, const Command& cmd) {
-    return expire_with_unit(store, cmd, 1000, "expire");
+std::string cmd_expire(Store& store, const Command& cmd, Command& log) {
+    return expire_relative(store, cmd, 1000, "expire", log);
 }
 
-std::string cmd_pexpire(Store& store, const Command& cmd) {
-    return expire_with_unit(store, cmd, 1, "pexpire");
+std::string cmd_pexpire(Store& store, const Command& cmd, Command& log) {
+    return expire_relative(store, cmd, 1, "pexpire", log);
 }
 
-std::string cmd_ttl(Store& store, const Command& cmd) {
+std::string cmd_pexpireat(Store& store, const Command& cmd, Command& log) {
+    const auto at = parse_int64(cmd[2]);
+    if (!at) {
+        return resp::error(kNotInteger);
+    }
+    return apply_expire_at(store, cmd[1], *at, log);
+}
+
+std::string cmd_ttl(Store& store, const Command& cmd, Command&) {
     const long long ms = store.ttl_ms(cmd[1]);
     if (ms < 0) {
         return resp::integer(ms);  // -2: no such key, -1: no deadline
@@ -103,12 +132,16 @@ std::string cmd_ttl(Store& store, const Command& cmd) {
     return resp::integer((ms + 500) / 1000);  // round to the nearest second
 }
 
-std::string cmd_pttl(Store& store, const Command& cmd) {
+std::string cmd_pttl(Store& store, const Command& cmd, Command&) {
     return resp::integer(store.ttl_ms(cmd[1]));
 }
 
-std::string cmd_persist(Store& store, const Command& cmd) {
-    return resp::integer(store.persist(cmd[1]) ? 1 : 0);
+std::string cmd_persist(Store& store, const Command& cmd, Command& log) {
+    const bool changed = store.persist(cmd[1]);
+    if (changed) {
+        log = cmd;
+    }
+    return resp::integer(changed ? 1 : 0);
 }
 
 std::string incr_reply(const IncrResult& r) {
@@ -123,12 +156,20 @@ std::string incr_reply(const IncrResult& r) {
     return resp::error("internal error");
 }
 
-std::string cmd_incr(Store& store, const Command& cmd) {
-    return incr_reply(store.incr_by(cmd[1], 1));
+std::string cmd_incr(Store& store, const Command& cmd, Command& log) {
+    const IncrResult r = store.incr_by(cmd[1], 1);
+    if (r.status == IncrResult::Status::kOk) {
+        log = cmd;
+    }
+    return incr_reply(r);
 }
 
-std::string cmd_decr(Store& store, const Command& cmd) {
-    return incr_reply(store.incr_by(cmd[1], -1));
+std::string cmd_decr(Store& store, const Command& cmd, Command& log) {
+    const IncrResult r = store.incr_by(cmd[1], -1);
+    if (r.status == IncrResult::Status::kOk) {
+        log = cmd;
+    }
+    return incr_reply(r);
 }
 
 // The "route table": command name -> handler + arity.
@@ -141,6 +182,7 @@ const std::unordered_map<std::string_view, CommandSpec>& command_table() {
         {"EXISTS", {cmd_exists, -2}},
         {"EXPIRE", {cmd_expire, 3}},
         {"PEXPIRE", {cmd_pexpire, 3}},
+        {"PEXPIREAT", {cmd_pexpireat, 3}},
         {"TTL", {cmd_ttl, 2}},
         {"PTTL", {cmd_pttl, 2}},
         {"PERSIST", {cmd_persist, 2}},
@@ -152,7 +194,7 @@ const std::unordered_map<std::string_view, CommandSpec>& command_table() {
 
 }  // namespace
 
-std::string execute(Store& store, const Command& command) {
+std::string execute(Store& store, const Command& command, Command* propagate) {
     if (command.empty()) {
         return resp::error("empty command");
     }
@@ -168,7 +210,13 @@ std::string execute(Store& store, const Command& command) {
     if (!arity_ok(spec.arity, command.size())) {
         return resp::error("wrong number of arguments for '" + name + "' command");
     }
-    return spec.handler(store, command);
+
+    Command log;
+    std::string reply = spec.handler(store, command, log);
+    if (propagate != nullptr) {
+        *propagate = std::move(log);  // always assigned, so a stale value never leaks through
+    }
+    return reply;
 }
 
 }  // namespace emberdb
