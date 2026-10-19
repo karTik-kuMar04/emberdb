@@ -191,3 +191,32 @@ TEST(DispatcherPropagation, PexpireatSetsAndDeletes) {
     EXPECT_EQ(fx, (Command{"DEL", "k"}));
     EXPECT_EQ(execute(s, {"EXISTS", "k"}), ":0\r\n");
 }
+
+TEST(DispatcherReplication, FlushallClearsEverythingAndIsLogged) {
+    Store s;
+    Command fx;
+    execute(s, {"SET", "a", "1"});
+    execute(s, {"SET", "b", "2"});
+    EXPECT_EQ(execute(s, {"DBSIZE"}), ":2\r\n");
+    EXPECT_EQ(execute(s, {"FLUSHALL"}, &fx), "+OK\r\n");
+    EXPECT_EQ(fx, (Command{"FLUSHALL"}));
+    EXPECT_EQ(execute(s, {"DBSIZE"}), ":0\r\n");
+    EXPECT_EQ(execute(s, {"GET", "a"}), "$-1\r\n");
+}
+
+TEST(DispatcherReplication, ReadOnlyBlocksWritesButNotReads) {
+    Store s;
+    execute(s, {"SET", "a", "1"});
+    Command fx{"stale"};
+    const std::string err = "-ERR You can't write against a read only replica.\r\n";
+    EXPECT_EQ(execute(s, {"SET", "a", "2"}, &fx, true), err);
+    EXPECT_TRUE(fx.empty());  // nothing to log or forward
+    EXPECT_EQ(execute(s, {"DEL", "a"}, nullptr, true), err);
+    EXPECT_EQ(execute(s, {"FLUSHALL"}, nullptr, true), err);
+    EXPECT_EQ(execute(s, {"INCR", "n"}, nullptr, true), err);
+    EXPECT_EQ(execute(s, {"EXPIRE", "a", "5"}, nullptr, true), err);
+    EXPECT_EQ(execute(s, {"GET", "a"}, nullptr, true), "$1\r\n1\r\n");
+    EXPECT_EQ(execute(s, {"PING"}, nullptr, true), "+PONG\r\n");
+    EXPECT_EQ(execute(s, {"TTL", "a"}, nullptr, true), ":-1\r\n");
+    EXPECT_EQ(execute(s, {"DBSIZE"}, nullptr, true), ":1\r\n");
+}

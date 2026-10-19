@@ -36,6 +36,7 @@ public:
     std::optional<std::string> get(const std::string& key);
     bool del(const std::string& key);  // true only if a live key was removed
     bool exists(const std::string& key);
+    void clear();  // FLUSHALL
 
     // Counts keys not yet purged, so it can include expired ones.
     [[nodiscard]] std::size_t size() const noexcept;
@@ -45,7 +46,7 @@ public:
     // Deadline relative to now. Returns false if the key doesn't exist.
     bool expire_in(const std::string& key, long long ms);
     // Deadline as an absolute time. A time that is not in the future deletes the key
-    // (except while loading, see set_loading).
+    // (except while loading or in passive mode, see below).
     ExpireResult expire_at(const std::string& key, std::int64_t at_ms);
     // Remaining milliseconds; -2 if the key doesn't exist, -1 if it has no deadline.
     long long ttl_ms(const std::string& key);
@@ -60,9 +61,15 @@ public:
     // While loading (AOF replay) nothing expires and past deadlines are stored as-is,
     // because replay runs later than the commands originally did.
     void set_loading(bool on) noexcept { loading_ = on; }
-    // When on, keys removed by expiry are remembered so the server can log them as DEL.
+    // When on, keys removed by expiry are remembered so the server can announce them as DEL.
     void set_track_expired(bool on) noexcept { track_expired_ = on; }
     std::vector<std::string> take_expired();
+
+    // --- replication support ---
+    // Passive mode (used by followers): an expired key is hidden from reads but never deleted
+    // by this store. Only an explicit DEL from the leader removes it.
+    void set_passive_expiry(bool on) noexcept { passive_expiry_ = on; }
+
     // Calls `visit` for every key that has not expired. Does not modify the store.
     void for_each_live(const EntryVisitor& visit) const;
 
@@ -84,6 +91,7 @@ private:
     std::vector<std::string> expired_log_;
     bool loading_ = false;
     bool track_expired_ = false;
+    bool passive_expiry_ = false;
 };
 
 }  // namespace emberdb

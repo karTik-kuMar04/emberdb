@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "emberdb/int_parse.hpp"
 #include "emberdb/resp_writer.hpp"
@@ -33,6 +34,13 @@ bool arity_ok(int arity, std::size_t argc) {
         return argc == static_cast<std::size_t>(arity);
     }
     return argc >= static_cast<std::size_t>(-arity);
+}
+
+// Commands that change data. A read-only follower refuses these from clients.
+bool is_write(std::string_view name) {
+    static const std::unordered_set<std::string_view> kWrites = {
+        "SET", "DEL", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST", "INCR", "DECR", "FLUSHALL"};
+    return kWrites.count(name) > 0;
 }
 
 // --- Handlers: arity is already validated, so indexing is safe ---
@@ -76,6 +84,18 @@ std::string cmd_exists(Store& store, const Command& cmd, Command&) {
         }
     }
     return resp::integer(found);
+}
+
+std::string cmd_flushall(Store& store, const Command& cmd, Command& log) {
+    store.clear();
+    log = cmd;
+    return resp::simple_string("OK");
+}
+
+// Counts keys not yet purged, so it can include expired ones. Handy for comparing a leader
+// with its follower.
+std::string cmd_dbsize(Store& store, const Command&, Command&) {
+    return resp::integer(static_cast<long long>(store.size()));
 }
 
 // Shared tail of EXPIRE, PEXPIRE and PEXPIREAT. The log always records an absolute time,
@@ -180,6 +200,8 @@ const std::unordered_map<std::string_view, CommandSpec>& command_table() {
         {"GET", {cmd_get, 2}},
         {"DEL", {cmd_del, -2}},
         {"EXISTS", {cmd_exists, -2}},
+        {"FLUSHALL", {cmd_flushall, 1}},
+        {"DBSIZE", {cmd_dbsize, 1}},
         {"EXPIRE", {cmd_expire, 3}},
         {"PEXPIRE", {cmd_pexpire, 3}},
         {"PEXPIREAT", {cmd_pexpireat, 3}},
@@ -194,7 +216,10 @@ const std::unordered_map<std::string_view, CommandSpec>& command_table() {
 
 }  // namespace
 
-std::string execute(Store& store, const Command& command, Command* propagate) {
+std::string execute(Store& store, const Command& command, Command* propagate, bool read_only) {
+    if (propagate != nullptr) {
+        propagate->clear();
+    }
     if (command.empty()) {
         return resp::error("empty command");
     }
@@ -210,11 +235,14 @@ std::string execute(Store& store, const Command& command, Command* propagate) {
     if (!arity_ok(spec.arity, command.size())) {
         return resp::error("wrong number of arguments for '" + name + "' command");
     }
+    if (read_only && is_write(name)) {
+        return resp::error("You can't write against a read only replica.");
+    }
 
     Command log;
     std::string reply = spec.handler(store, command, log);
     if (propagate != nullptr) {
-        *propagate = std::move(log);  // always assigned, so a stale value never leaks through
+        *propagate = std::move(log);
     }
     return reply;
 }

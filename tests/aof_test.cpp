@@ -262,3 +262,17 @@ TEST_F(AofTest, FailedRewriteLeavesOldLogUsable) {
     EXPECT_EQ(s2.get("a").value(), "1");
     EXPECT_EQ(s2.get("b").value(), "2");
 }
+
+TEST_F(AofTest, FlushallInTheLogClearsEarlierData) {
+    {
+        Store s;
+        auto aof = Aof::open(path_, Aof::Fsync::kNever, s);
+        run(s, *aof, {"SET", "a", "1"});
+        run(s, *aof, {"FLUSHALL"});
+        run(s, *aof, {"SET", "b", "2"});
+    }
+    Store s2;
+    auto aof2 = Aof::open(path_, Aof::Fsync::kNever, s2);
+    EXPECT_FALSE(s2.get("a").has_value());
+    EXPECT_EQ(s2.get("b").value(), "2");
+}
