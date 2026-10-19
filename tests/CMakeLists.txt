@@ -17,6 +17,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(server_test server_test.cpp)
     target_link_libraries(server_test PRIVATE emberdb_lib Threads::Threads GTest::gtest_main)
     gtest_discover_tests(server_test)
+
+    add_executable(aof_test aof_test.cpp)
+    target_link_libraries(aof_test PRIVATE emberdb_lib GTest::gtest_main)
+    gtest_discover_tests(aof_test)
 endif()
 
 

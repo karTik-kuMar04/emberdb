@@ -18,7 +18,7 @@ target_compile_options(emberdb_lib PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wc
 
 # --- Server + executable: epoll is Linux-only ---
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_sources(emberdb_lib PRIVATE src/server.cpp)
+    target_sources(emberdb_lib PRIVATE src/server.cpp src/aof.cpp)
     add_executable(emberdb src/main.cpp)
     target_link_libraries(emberdb PRIVATE emberdb_lib)
     target_compile_options(emberdb PRIVATE -Wall -Wextra -Wpedantic)

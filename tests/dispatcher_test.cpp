@@ -130,3 +130,64 @@ TEST(DispatcherCounters, IncrErrors) {
     EXPECT_EQ(execute(s, {"INCR", "big"}), "-ERR increment or decrement would overflow\r\n");
     EXPECT_EQ(execute(s, {"INCR"}), "-ERR wrong number of arguments for 'INCR' command\r\n");
 }
+
+TEST(DispatcherPropagation, WritesAreLoggedAndReadsAreNot) {
+    Store s;
+    Command fx;
+    execute(s, {"SET", "k", "v"}, &fx);
+    EXPECT_EQ(fx, (Command{"SET", "k", "v"}));
+    execute(s, {"GET", "k"}, &fx);
+    EXPECT_TRUE(fx.empty());
+    execute(s, {"DEL", "k"}, &fx);
+    EXPECT_EQ(fx, (Command{"DEL", "k"}));
+    execute(s, {"DEL", "k"}, &fx);  // nothing to delete
+    EXPECT_TRUE(fx.empty());
+}
+
+TEST(DispatcherPropagation, ExpireIsRewrittenToAbsoluteTime) {
+    FakeClock clk;  // starts at 1000
+    Store s(clk.fn());
+    Command fx;
+    execute(s, {"SET", "k", "v"}, &fx);
+    execute(s, {"EXPIRE", "k", "10"}, &fx);
+    EXPECT_EQ(fx, (Command{"PEXPIREAT", "k", "11000"}));
+    execute(s, {"PEXPIRE", "k", "500"}, &fx);
+    EXPECT_EQ(fx, (Command{"PEXPIREAT", "k", "1500"}));
+}
+
+TEST(DispatcherPropagation, NonPositiveExpireBecomesDel) {
+    FakeClock clk;
+    Store s(clk.fn());
+    Command fx;
+    execute(s, {"SET", "k", "v"}, &fx);
+    EXPECT_EQ(execute(s, {"EXPIRE", "k", "0"}, &fx), ":1\r\n");
+    EXPECT_EQ(fx, (Command{"DEL", "k"}));
+    EXPECT_EQ(execute(s, {"GET", "k"}), "$-1\r\n");
+}
+
+TEST(DispatcherPropagation, FailedAndNoopCommandsAreNotLogged) {
+    Store s;
+    Command fx;
+    execute(s, {"EXPIRE", "missing", "10"}, &fx);
+    EXPECT_TRUE(fx.empty());
+    execute(s, {"SET", "str", "abc"}, &fx);
+    execute(s, {"INCR", "str"}, &fx);  // fails: not an integer
+    EXPECT_TRUE(fx.empty());
+    execute(s, {"PERSIST", "str"}, &fx);  // no deadline to remove
+    EXPECT_TRUE(fx.empty());
+    execute(s, {"INCR", "n"}, &fx);
+    EXPECT_EQ(fx, (Command{"INCR", "n"}));
+}
+
+TEST(DispatcherPropagation, PexpireatSetsAndDeletes) {
+    FakeClock clk;
+    Store s(clk.fn());
+    Command fx;
+    execute(s, {"SET", "k", "v"}, &fx);
+    EXPECT_EQ(execute(s, {"PEXPIREAT", "k", "5000"}, &fx), ":1\r\n");
+    EXPECT_EQ(fx, (Command{"PEXPIREAT", "k", "5000"}));
+    EXPECT_EQ(execute(s, {"PTTL", "k"}), ":4000\r\n");
+    EXPECT_EQ(execute(s, {"PEXPIREAT", "k", "500"}, &fx), ":1\r\n");  // already in the past
+    EXPECT_EQ(fx, (Command{"DEL", "k"}));
+    EXPECT_EQ(execute(s, {"EXISTS", "k"}), ":0\r\n");
+}
