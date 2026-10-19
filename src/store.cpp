@@ -164,4 +164,14 @@ std::vector<std::string> Store::take_expired() {
     return out;
 }
 
+void Store::for_each_live(const EntryVisitor& visit) const {
+    const std::int64_t now = clock_();
+    for (const auto& [key, entry] : data_) {
+        if (entry.expire_at && *entry.expire_at <= now) {
+            continue;  // expired but not purged yet: leave it out of the snapshot
+        }
+        visit(key, entry.value, entry.expire_at);
+    }
+}
+
 }  // namespace emberdb

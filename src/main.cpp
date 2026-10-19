@@ -1,4 +1,5 @@
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -25,6 +26,7 @@ struct Options {
     std::uint16_t port = 6380;
     std::string aof_path;  // empty = persistence off
     emberdb::Aof::Fsync fsync = emberdb::Aof::Fsync::kEverySecond;
+    std::size_t aof_rewrite_min_bytes = 64UL * 1024 * 1024;
 };
 
 bool parse_args(int argc, char** argv, Options& opts) {
@@ -48,6 +50,12 @@ bool parse_args(int argc, char** argv, Options& opts) {
                 return false;
             }
             opts.fsync = *policy;
+        } else if (flag == "--aof-rewrite-min-bytes") {
+            const auto bytes = emberdb::parse_int64(value);
+            if (!bytes || *bytes < 1) {
+                return false;
+            }
+            opts.aof_rewrite_min_bytes = static_cast<std::size_t>(*bytes);
         } else {
             return false;
         }
@@ -60,7 +68,8 @@ bool parse_args(int argc, char** argv, Options& opts) {
 int main(int argc, char** argv) {
     Options opts;
     if (!parse_args(argc, argv, opts)) {
-        std::cerr << "usage: emberdb [--port N] [--aof PATH] [--fsync always|everysec|no]\n";
+        std::cerr << "usage: emberdb [--port N] [--aof PATH] [--fsync always|everysec|no]\n"
+                     "               [--aof-rewrite-min-bytes N]\n";
         return 1;
     }
 
@@ -74,6 +83,7 @@ int main(int argc, char** argv) {
         if (!opts.aof_path.empty()) {
             emberdb::Aof::LoadStats stats;
             aof = emberdb::Aof::open(opts.aof_path, opts.fsync, store, &stats);
+            aof->set_rewrite_policy(emberdb::Aof::RewritePolicy{opts.aof_rewrite_min_bytes, 100});
             std::cout << "AOF: replayed " << stats.commands << " commands, " << store.size()
                       << " keys in memory" << std::endl;
             if (stats.tail_bytes > 0) {
