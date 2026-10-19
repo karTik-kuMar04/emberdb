@@ -44,6 +44,7 @@ private:
     bool update_interest(int fd, Connection& c);
     void close_connection(int fd);
     void log_effects(const Command& effect);
+    std::string run_rewrite(const Command& cmd);
 
     Store& store_;
     Aof* aof_;

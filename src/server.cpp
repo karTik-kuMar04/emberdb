@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -43,6 +44,19 @@ bool epoll_update(int ep, int op, int fd, std::uint32_t events) {
     ev.events = events;
     ev.data.fd = fd;
     return ::epoll_ctl(ep, op, fd, &ev) == 0;
+}
+// REWRITEAOF needs the Aof, which the dispatcher doesn't know about, so the server handles it.
+bool is_rewrite_command(const Command& cmd) {
+    constexpr std::string_view kName = "REWRITEAOF";
+    if (cmd.empty() || cmd[0].size() != kName.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < kName.size(); ++i) {
+        if (std::toupper(static_cast<unsigned char>(cmd[0][i])) != kName[i]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -109,9 +123,19 @@ void Server::run() {
         // probably more due, so come back immediately instead of sleeping.
         const std::size_t removed = store_.purge_expired(kPurgeBudget);
         timeout_ms = (removed == kPurgeBudget) ? 0 : kEpollTimeoutMs;
-                if (aof_ != nullptr) {
+        if (aof_ != nullptr) {
             log_effects(Command{});  // records a DEL for every key that just expired
             aof_->tick();            // write it out, and fsync if "everysec" is due
+            if (aof_->rewrite_due()) {
+                const std::size_t before = aof_->size();
+                try {
+                    aof_->rewrite(store_);
+                    std::cout << "AOF rewritten: " << before << " -> " << aof_->size()
+                              << " bytes" << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "AOF rewrite failed (retrying in 60s): " << e.what() << std::endl;
+                }
+            }
         }
     }
 }
@@ -199,10 +223,14 @@ bool Server::process_input(Connection& c) {
             pos = c.in.size();  // discard the rest of the garbage
             break;
         }
-        Command effect;
-        c.out += execute(store_, r.command, aof_ != nullptr ? &effect : nullptr);
-        if (aof_ != nullptr) {
-            log_effects(effect);
+        if (is_rewrite_command(r.command)) {
+            c.out += run_rewrite(r.command);
+        } else {
+            Command effect;
+            c.out += execute(store_, r.command, aof_ != nullptr ? &effect : nullptr);
+            if (aof_ != nullptr) {
+                log_effects(effect);
+            }
         }
         pos += r.consumed;
         if (c.out.size() > kMaxOutputBytes) {
@@ -273,6 +301,21 @@ void Server::log_effects(const Command& effect) {
     if (!effect.empty()) {
         aof_->append(resp::command(effect));
     }
+}
+
+std::string Server::run_rewrite(const Command& cmd) {
+    if (cmd.size() != 1) {
+        return resp::error("wrong number of arguments for 'REWRITEAOF' command");
+    }
+    if (aof_ == nullptr) {
+        return resp::error("AOF is not enabled");
+    }
+    try {
+        aof_->rewrite(store_);
+    } catch (const std::exception& e) {
+        return resp::error(std::string("AOF rewrite failed: ") + e.what());
+    }
+    return resp::simple_string("OK");
 }
 
 }  // namespace emberdb

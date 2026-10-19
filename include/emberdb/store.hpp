@@ -24,6 +24,10 @@ struct IncrResult {
 
 enum class ExpireResult { kNoSuchKey, kDeadlineSet, kKeyDeleted };
 
+// Called once per live key: (key, value, absolute deadline if it has one).
+using EntryVisitor =
+    std::function<void(const std::string&, const std::string&, std::optional<std::int64_t>)>;
+
 class Store {
 public:
     explicit Store(Clock clock = unix_now_ms);
@@ -59,6 +63,8 @@ public:
     // When on, keys removed by expiry are remembered so the server can log them as DEL.
     void set_track_expired(bool on) noexcept { track_expired_ = on; }
     std::vector<std::string> take_expired();
+    // Calls `visit` for every key that has not expired. Does not modify the store.
+    void for_each_live(const EntryVisitor& visit) const;
 
 private:
     struct Entry {

@@ -1,3 +1,5 @@
+#include "emberdb/resp_writer.hpp"
+#include <filesystem>
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <sys/socket.h>
@@ -194,6 +196,65 @@ TEST(ServerPersistence, DataSurvivesRestart) {
         ASSERT_TRUE(c.valid());
         send_all(c.fd(), "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n");
         EXPECT_EQ(recv_n(c.fd(), 11), "$5\r\nember\r\n");
+        server.stop();
+        t.join();
+    }
+    ::unlink(path.c_str());
+}
+
+TEST_F(ServerTest, RewriteAofWithoutAofIsAnError) {
+    emberdb::Socket c(dial(port_));
+    ASSERT_TRUE(c.valid());
+    send_all(c.fd(), "*1\r\n$10\r\nREWRITEAOF\r\n");
+    const std::string expected = "-ERR AOF is not enabled\r\n";
+    EXPECT_EQ(recv_n(c.fd(), expected.size()), expected);
+}
+
+TEST(ServerPersistence, RewriteCompactsLogAndKeepsData) {
+    char tpl[] = "/tmp/emberdb_rw_XXXXXX";
+    const int tmp_fd = ::mkstemp(tpl);
+    ASSERT_GE(tmp_fd, 0);
+    ::close(tmp_fd);
+    const std::string path = tpl;
+
+    std::uintmax_t before = 0;
+    std::uintmax_t after = 0;
+    {
+        emberdb::Store store;
+        auto aof = emberdb::Aof::open(path, emberdb::Aof::Fsync::kAlways, store);
+        emberdb::Server server(store, 0, aof.get());
+        std::thread t([&] { server.run(); });
+        emberdb::Socket c(dial(server.port()));
+        EXPECT_TRUE(c.valid());
+
+        std::string batch;
+        std::string expected_replies;
+        for (int i = 0; i < 100; ++i) {
+            batch += emberdb::resp::command({"SET", "k", "v" + std::to_string(i)});
+            expected_replies += "+OK\r\n";
+        }
+        send_all(c.fd(), batch);
+        EXPECT_EQ(recv_n(c.fd(), expected_replies.size()), expected_replies);
+        before = std::filesystem::file_size(path);
+
+        send_all(c.fd(), "*1\r\n$10\r\nREWRITEAOF\r\n");
+        EXPECT_EQ(recv_n(c.fd(), 5), "+OK\r\n");
+        after = std::filesystem::file_size(path);
+
+        server.stop();
+        t.join();
+    }
+    EXPECT_LT(after, before);
+
+    {
+        emberdb::Store store;
+        auto aof = emberdb::Aof::open(path, emberdb::Aof::Fsync::kAlways, store);
+        emberdb::Server server(store, 0, aof.get());
+        std::thread t([&] { server.run(); });
+        emberdb::Socket c(dial(server.port()));
+        EXPECT_TRUE(c.valid());
+        send_all(c.fd(), "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+        EXPECT_EQ(recv_n(c.fd(), 9), "$3\r\nv99\r\n");
         server.stop();
         t.join();
     }

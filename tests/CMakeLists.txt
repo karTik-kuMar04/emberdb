@@ -31,3 +31,7 @@ gtest_discover_tests(resp_parser_test)
 add_executable(dispatcher_test dispatcher_test.cpp)
 target_link_libraries(dispatcher_test PRIVATE emberdb_lib GTest::gtest_main)
 gtest_discover_tests(dispatcher_test)
+
+add_executable(snapshot_test snapshot_test.cpp)
+target_link_libraries(snapshot_test PRIVATE emberdb_lib GTest::gtest_main)
+gtest_discover_tests(snapshot_test)
