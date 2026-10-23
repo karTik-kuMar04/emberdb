@@ -11,9 +11,11 @@ std::string simple_string(std::string_view s) {
     return out;
 }
 
-std::string error(std::string_view msg) {
-    std::string out = "-ERR ";
-    out.reserve(msg.size() + 8);
+std::string error_code(std::string_view code, std::string_view msg) {
+    std::string out = "-";
+    out.reserve(code.size() + msg.size() + 8);
+    out += code;
+    out += ' ';
     for (char c : msg) {
         // A raw CR/LF would end the reply early and let a client inject
         // fake protocol lines, so we neutralize them.
@@ -21,6 +23,10 @@ std::string error(std::string_view msg) {
     }
     out += "\r\n";
     return out;
+}
+
+std::string error(std::string_view msg) {
+    return error_code("ERR", msg);
 }
 
 std::string integer(long long n) {

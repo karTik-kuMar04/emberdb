@@ -454,3 +454,60 @@ TEST_F(ReplicationTest, InfoShowsRolesAndFollowers) {
     EXPECT_TRUE(contains(info, "master_host:127.0.0.1"));
     EXPECT_TRUE(contains(info, "master_port:" + std::to_string(leader_port())));
 }
+
+TEST(ServerEviction, LruKeepsMemoryBoundedAndInfoReportsIt) {
+    constexpr std::size_t kLimit = 20 * 1024;
+    emberdb::Store store;
+    store.set_maxmemory(kLimit);
+    store.set_eviction_policy(emberdb::EvictionPolicy::kAllKeysLru);
+    emberdb::Server server(store, 0);
+    std::thread t([&] { server.run(); });
+
+    const std::string value(1000, 'x');
+    emberdb::Socket c(dial(server.port()));
+    EXPECT_TRUE(c.valid());
+    std::string batch;
+    std::string expected;
+    for (int i = 0; i < 200; ++i) {
+        batch += emberdb::resp::command({"SET", "key" + std::to_string(i), value});
+        expected += "+OK\r\n";
+    }
+    send_all(c.fd(), batch);
+    EXPECT_EQ(recv_n(c.fd(), expected.size()), expected);
+
+    send_all(c.fd(), emberdb::resp::command({"GET", "key199"}));
+    const std::string newest = "$1000\r\n" + value + "\r\n";
+    EXPECT_EQ(recv_n(c.fd(), newest.size()), newest);  // the newest key survived
+    send_all(c.fd(), emberdb::resp::command({"GET", "key0"}));
+    EXPECT_EQ(recv_n(c.fd(), 5), "$-1\r\n");  // the oldest was evicted
+
+    const std::string info = ask(server.port(), {"INFO"});
+    EXPECT_TRUE(contains(info, "maxmemory:20480"));
+    EXPECT_TRUE(contains(info, "maxmemory_policy:allkeys-lru"));
+    EXPECT_FALSE(contains(info, "evicted_keys:0\r\n"));
+
+    server.stop();
+    t.join();
+    EXPECT_GT(store.evicted_keys(), 100U);
+    EXPECT_LE(store.used_memory(), kLimit + 2048);  // at most one command over the limit
+    EXPECT_TRUE(store.check_invariants());
+}
+
+TEST(ServerEviction, NoEvictionRepliesOomWhenFull) {
+    emberdb::Store store;
+    store.set_maxmemory(100);  // default policy: noeviction
+    emberdb::Server server(store, 0);
+    std::thread t([&] { server.run(); });
+    const std::uint16_t port = server.port();
+
+    const std::string value(1000, 'x');
+    EXPECT_EQ(ask(port, {"SET", "a", value}), "+OK\r\n");  // the store was empty, so nothing to refuse yet
+    EXPECT_EQ(ask(port, {"SET", "b", value}),
+              "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    EXPECT_EQ(ask(port, {"GET", "a"}), "$1000\r\n" + value + "\r\n");  // reads still work
+    EXPECT_EQ(ask(port, {"DEL", "a"}), ":1\r\n");
+    EXPECT_EQ(ask(port, {"SET", "b", value}), "+OK\r\n");  // space was freed
+
+    server.stop();
+    t.join();
+}

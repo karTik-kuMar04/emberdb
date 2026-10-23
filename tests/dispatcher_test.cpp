@@ -220,3 +220,50 @@ TEST(DispatcherReplication, ReadOnlyBlocksWritesButNotReads) {
     EXPECT_EQ(execute(s, {"TTL", "a"}, nullptr, true), ":-1\r\n");
     EXPECT_EQ(execute(s, {"DBSIZE"}, nullptr, true), ":1\r\n");
 }
+
+TEST(DispatcherMemory, OomRefusesWritesButAllowsReadsAndDeletes) {
+    Store s;  // noeviction by default
+    s.set("a", std::string(100, 'x'));
+    s.set_maxmemory(s.used_memory() - 1);  // already over the limit
+    const std::string oom = "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
+    EXPECT_EQ(execute(s, {"SET", "b", "1"}), oom);
+    EXPECT_EQ(execute(s, {"INCR", "n"}), oom);
+    EXPECT_EQ(execute(s, {"DECR", "n"}), oom);
+    EXPECT_EQ(execute(s, {"GET", "a"}), "$100\r\n" + std::string(100, 'x') + "\r\n");
+    EXPECT_EQ(execute(s, {"EXPIRE", "a", "100"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"PING"}), "+PONG\r\n");
+    EXPECT_EQ(execute(s, {"DEL", "a"}), ":1\r\n");
+    EXPECT_EQ(execute(s, {"SET", "b", "1"}), "+OK\r\n");  // the DEL freed the space
+}
+
+TEST(DispatcherMemory, LruMakesRoomForNewWrites) {
+    Store s;
+    s.set_track_expired(true);
+    s.set_eviction_policy(emberdb::EvictionPolicy::kAllKeysLru);
+    execute(s, {"SET", "k0", "0123456789"});
+    execute(s, {"SET", "k1", "0123456789"});
+    execute(s, {"SET", "k2", "0123456789"});
+    s.set_maxmemory(s.used_memory() - 1);
+    EXPECT_EQ(execute(s, {"SET", "k3", "0123456789"}), "+OK\r\n");
+    EXPECT_EQ(execute(s, {"GET", "k0"}), "$-1\r\n");  // the oldest key made way for k3
+    EXPECT_EQ(execute(s, {"EXISTS", "k1", "k2", "k3"}), ":3\r\n");
+    EXPECT_EQ(s.evicted_keys(), 1U);
+    EXPECT_EQ(s.take_expired(), (std::vector<std::string>{"k0"}));  // announced as a DEL
+}
+
+TEST(DispatcherMemory, FollowerStillAppliesLeaderWritesOverTheLimit) {
+    Store s;
+    s.set_maxmemory(1);
+    s.set_passive_expiry(true);  // what a follower is
+    EXPECT_EQ(execute(s, {"SET", "a", "1"}), "+OK\r\n");  // not read-only: this is the leader's stream
+    EXPECT_EQ(execute(s, {"SET", "b", "1"}), "+OK\r\n");
+    EXPECT_EQ(s.size(), 2U);
+}
+
+TEST(DispatcherMemory, ReadOnlyErrorTakesPriorityOverOom) {
+    Store s;
+    s.set("a", std::string(100, 'x'));
+    s.set_maxmemory(1);
+    EXPECT_EQ(execute(s, {"SET", "b", "1"}, nullptr, true),
+              "-ERR You can't write against a read only replica.\r\n");
+}
