@@ -30,6 +30,8 @@ struct Options {
     std::size_t aof_rewrite_min_bytes = 64UL * 1024 * 1024;
     std::string leader_host;  // empty = run as a leader
     std::uint16_t leader_port = 0;
+    std::size_t maxmemory = 0;  // 0 = unlimited
+    emberdb::EvictionPolicy policy = emberdb::EvictionPolicy::kNoEviction;
 };
 
 bool parse_args(int argc, char** argv, Options& opts) {
@@ -70,6 +72,18 @@ bool parse_args(int argc, char** argv, Options& opts) {
             }
             opts.leader_host = std::string(value.substr(0, colon));
             opts.leader_port = static_cast<std::uint16_t>(*port);
+        } else if (flag == "--maxmemory") {
+            const auto bytes = emberdb::parse_bytes(value);
+            if (!bytes) {
+                return false;
+            }
+            opts.maxmemory = static_cast<std::size_t>(*bytes);
+        } else if (flag == "--maxmemory-policy") {
+            const auto policy = emberdb::parse_eviction_policy(value);
+            if (!policy) {
+                return false;
+            }
+            opts.policy = *policy;
         } else {
             return false;
         }
@@ -83,7 +97,9 @@ int main(int argc, char** argv) {
     Options opts;
     if (!parse_args(argc, argv, opts)) {
         std::cerr << "usage: emberdb [--port N] [--aof PATH] [--fsync always|everysec|no]\n"
-                     "               [--aof-rewrite-min-bytes N] [--replicaof HOST:PORT]\n";
+                     "               [--aof-rewrite-min-bytes N] [--replicaof HOST:PORT]\n"
+                     "               [--maxmemory SIZE] [--maxmemory-policy noeviction|allkeys-lru]\n"
+                     "  SIZE accepts k, kb, m, mb, g, gb (for example 100mb)\n";
         return 1;
     }
 
@@ -106,6 +122,15 @@ int main(int argc, char** argv) {
                           << std::endl;
             }
         }
+
+        // Applied after the log is loaded, so replaying it can never evict anything.
+        store.set_eviction_policy(opts.policy);
+        store.set_maxmemory(opts.maxmemory);
+        if (opts.maxmemory > 0) {
+            std::cout << "maxmemory: " << opts.maxmemory << " bytes, policy "
+                      << emberdb::policy_name(opts.policy) << std::endl;
+        }
+
         emberdb::Server server(store, opts.port, aof.get());
         g_server = &server;
 

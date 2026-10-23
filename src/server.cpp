@@ -512,6 +512,11 @@ std::string Server::cmd_info() const {
         out += "slave" + std::to_string(index++) + ":pending_bytes=" + std::to_string(pending) +
                "\r\n";
     }
+    out += "\r\n# Memory\r\n";
+    out += "used_memory:" + std::to_string(store_.used_memory()) + "\r\n";
+    out += "maxmemory:" + std::to_string(store_.maxmemory()) + "\r\n";
+    out += std::string("maxmemory_policy:") + policy_name(store_.eviction_policy()) + "\r\n";
+    out += "evicted_keys:" + std::to_string(store_.evicted_keys()) + "\r\n";
     return resp::bulk_string(out);
 }
 

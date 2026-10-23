@@ -13,21 +13,69 @@ std::int64_t unix_now_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+const char* policy_name(EvictionPolicy policy) {
+    return policy == EvictionPolicy::kAllKeysLru ? "allkeys-lru" : "noeviction";
+}
+
+std::optional<EvictionPolicy> parse_eviction_policy(std::string_view text) {
+    if (text == "noeviction") {
+        return EvictionPolicy::kNoEviction;
+    }
+    if (text == "allkeys-lru") {
+        return EvictionPolicy::kAllKeysLru;
+    }
+    return std::nullopt;
+}
+
 Store::Store(Clock clock) : clock_(std::move(clock)) {}
+
+std::size_t Store::entry_cost(const std::string& key, const Entry& entry) {
+    return kEntryOverhead + key.size() + entry.value.size();
+}
+
+std::size_t Store::expiry_cost(const std::string& key) {
+    return kExpiryOverhead + key.size();
+}
+
+void Store::touch(Entry& entry) {
+    lru_.splice(lru_.begin(), lru_, entry.lru_it);  // O(1), and no iterator is invalidated
+}
+
+// Finds the entry or creates an empty one, and marks it most recently used.
+Store::Entry& Store::acquire(const std::string& key) {
+    auto [it, inserted] = data_.try_emplace(key);
+    Entry& entry = it->second;
+    if (inserted) {
+        lru_.push_front(&it->first);  // map nodes never move, so this pointer stays valid
+        entry.lru_it = lru_.begin();
+        used_ += kEntryOverhead + key.size();
+    } else {
+        touch(entry);
+    }
+    return entry;
+}
+
+void Store::replace_value(Entry& entry, std::string value) {
+    used_ -= entry.value.size();
+    entry.value = std::move(value);
+    used_ += entry.value.size();
+}
 
 void Store::drop_expiry(const std::string& key, Entry& entry) {
     if (entry.expire_at) {
         expirations_.erase(std::make_pair(*entry.expire_at, key));
+        used_ -= expiry_cost(key);
         entry.expire_at.reset();
     }
 }
 
-// The one place a key is removed. `expired` says it died of old age rather than by command.
-void Store::erase_entry(Map::iterator it, bool expired) {
-    if (expired && track_expired_) {
+void Store::erase_entry(Map::iterator it, bool announce) {
+    if (announce && track_expired_) {
         expired_log_.push_back(it->first);
     }
     drop_expiry(it->first, it->second);
+    lru_.erase(it->second.lru_it);
+    used_ -= entry_cost(it->first, it->second);
     data_.erase(it);
 }
 
@@ -44,13 +92,14 @@ Store::Entry* Store::find_live(const std::string& key, std::int64_t now) {
         erase_entry(it, true);  // lazy expiry: the deadline passed, so the key is gone
         return nullptr;
     }
+    touch(entry);  // every read or write of a live key counts as a use
     return &entry;
 }
 
 void Store::set(const std::string& key, std::string value) {
-    Entry& entry = data_[key];
+    Entry& entry = acquire(key);
     drop_expiry(key, entry);
-    entry.value = std::move(value);
+    replace_value(entry, std::move(value));
 }
 
 std::optional<std::string> Store::get(const std::string& key) {
@@ -68,7 +117,7 @@ bool Store::del(const std::string& key) {
     }
     const bool expired =
         !loading_ && !passive_expiry_ && it->second.expire_at && *it->second.expire_at <= clock_();
-    erase_entry(it, expired);
+    erase_entry(it, expired);  // an expired key is announced, a normal delete is not
     return !expired;
 }
 
@@ -79,6 +128,8 @@ bool Store::exists(const std::string& key) {
 void Store::clear() {
     data_.clear();
     expirations_.clear();
+    lru_.clear();
+    used_ = 0;
 }
 
 std::size_t Store::size() const noexcept {
@@ -102,6 +153,7 @@ ExpireResult Store::expire_at(const std::string& key, std::int64_t at_ms) {
     drop_expiry(key, *entry);
     entry->expire_at = at_ms;
     expirations_.emplace(at_ms, key);
+    used_ += expiry_cost(key);
     return ExpireResult::kDeadlineSet;
 }
 
@@ -164,9 +216,9 @@ IncrResult Store::incr_by(const std::string& key, long long delta) {
         return {IncrResult::Status::kOverflow, 0};
     }
     if (entry == nullptr) {
-        entry = &data_[key];  // new key, no deadline
+        entry = &acquire(key);  // new key, no deadline
     }
-    entry->value = std::to_string(next);  // an existing deadline is kept
+    replace_value(*entry, std::to_string(next));  // an existing deadline is kept
     return {IncrResult::Status::kOk, next};
 }
 
@@ -184,6 +236,58 @@ void Store::for_each_live(const EntryVisitor& visit) const {
         }
         visit(key, entry.value, entry.expire_at);
     }
+}
+
+bool Store::evict_one() {
+    if (lru_.empty()) {
+        return false;
+    }
+    const auto it = data_.find(*lru_.back());  // the least recently used key
+    if (it == data_.end()) {
+        lru_.pop_back();  // cannot happen: the list and the map always agree
+        return true;
+    }
+    erase_entry(it, true);  // announced, so the AOF and followers see a DEL
+    ++evicted_keys_;
+    return true;
+}
+
+bool Store::make_room() {
+    if (max_memory_ == 0 || loading_ || passive_expiry_ || used_ <= max_memory_) {
+        return true;
+    }
+    purge_expired(kMaxEvictionsPerCall);  // expired keys are free to remove, so take them first
+    if (policy_ == EvictionPolicy::kNoEviction) {
+        return used_ <= max_memory_;
+    }
+    std::size_t evicted = 0;
+    while (used_ > max_memory_ && evicted < kMaxEvictionsPerCall) {
+        if (!evict_one()) {
+            break;
+        }
+        ++evicted;
+    }
+    // Hitting the cap is not a failure: the command goes ahead and the next one keeps evicting.
+    return used_ <= max_memory_ || evicted >= kMaxEvictionsPerCall;
+}
+
+bool Store::check_invariants() const {
+    std::size_t memory = 0;
+    std::size_t with_deadline = 0;
+    for (const auto& [key, entry] : data_) {
+        memory += entry_cost(key, entry);
+        if (*entry.lru_it != &key) {
+            return false;  // the list entry must point at this very key
+        }
+        if (entry.expire_at) {
+            memory += expiry_cost(key);
+            ++with_deadline;
+            if (expirations_.count(std::make_pair(*entry.expire_at, key)) == 0) {
+                return false;
+            }
+        }
+    }
+    return memory == used_ && with_deadline == expirations_.size() && lru_.size() == data_.size();
 }
 
 }  // namespace emberdb

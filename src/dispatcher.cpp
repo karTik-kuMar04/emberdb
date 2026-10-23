@@ -43,6 +43,12 @@ bool is_write(std::string_view name) {
     return kWrites.count(name) > 0;
 }
 
+// Commands that can make the dataset bigger. Over the memory limit these either evict keys to
+// make room or are refused. Reads, DEL, EXPIRE and the rest always work.
+bool denies_oom(std::string_view name) {
+    return name == "SET" || name == "INCR" || name == "DECR";
+}
+
 // --- Handlers: arity is already validated, so indexing is safe ---
 
 std::string cmd_ping(Store&, const Command&, Command&) {
@@ -237,6 +243,10 @@ std::string execute(Store& store, const Command& command, Command* propagate, bo
     }
     if (read_only && is_write(name)) {
         return resp::error("You can't write against a read only replica.");
+    }
+
+    if (denies_oom(name) && !store.make_room()) {
+        return resp::error_code("OOM", "command not allowed when used memory > 'maxmemory'.");
     }
 
     Command log;
