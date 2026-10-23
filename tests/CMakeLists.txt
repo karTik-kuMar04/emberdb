@@ -35,3 +35,11 @@ gtest_discover_tests(dispatcher_test)
 add_executable(snapshot_test snapshot_test.cpp)
 target_link_libraries(snapshot_test PRIVATE emberdb_lib GTest::gtest_main)
 gtest_discover_tests(snapshot_test)
+
+add_executable(security_test security_test.cpp)
+target_link_libraries(security_test PRIVATE emberdb_lib GTest::gtest_main)
+gtest_discover_tests(security_test)
+
+add_executable(config_test config_test.cpp)
+target_link_libraries(config_test PRIVATE emberdb_lib GTest::gtest_main)
+gtest_discover_tests(config_test)

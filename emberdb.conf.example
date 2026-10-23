@@ -1,0 +1,17 @@
+# emberdb configuration. Copy to emberdb.conf, run `chmod 600 emberdb.conf`, then edit.
+# Usage: emberdb --config emberdb.conf   (options on the command line after --config override it)
+# One "key value" per line. The value is the rest of the line. '#' starts a comment.
+
+port 6380
+bind 127.0.0.1
+
+# Passwords: use 12 or more random characters.
+# requirepass change-me-to-a-long-random-password
+# masterauth the-leaders-password
+
+# replicaof 10.0.0.5:6380
+
+# aof /var/lib/emberdb/appendonly.aof
+# fsync everysec
+# maxmemory 256mb
+# maxmemory-policy allkeys-lru
