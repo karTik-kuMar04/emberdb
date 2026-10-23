@@ -35,6 +35,10 @@ constexpr std::size_t kCompactThreshold = 64UL * 1024;
 constexpr std::size_t kFollowerBufferLimit = 256UL * 1024 * 1024;
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
 
+// An anonymous client may buffer this much before it has to log in, enough for any AUTH command.
+constexpr std::size_t kMaxUnauthInputBytes = 16UL * 1024;
+constexpr int kMaxAuthFailures = 3;  // wrong guesses allowed on one connection
+
 constexpr std::uint32_t kIn = EPOLLIN;
 constexpr std::uint32_t kOut = EPOLLOUT;
 constexpr std::uint32_t kErr = EPOLLERR;
@@ -69,9 +73,16 @@ bool make_address(const std::string& host, std::uint16_t port, sockaddr_in& out)
 
 }  // namespace
 
-Server::Server(Store& store, std::uint16_t port, Aof* aof) : store_(store), aof_(aof) {
-    // Keys that expire are announced (to the AOF and to followers) as DEL records.
+Server::Server(Store& store, std::uint16_t port, Aof* aof, const std::string& bind_address)
+    : store_(store), aof_(aof) {
+    // Keys that expire or get evicted are announced (to the AOF and to followers) as DEL records.
     store_.set_track_expired(true);
+
+    sockaddr_in addr{};
+    if (!make_address(bind_address, port, addr)) {
+        throw std::runtime_error("invalid bind address '" + bind_address +
+                                 "' (use an IPv4 address or localhost)");
+    }
 
     listener_ = Socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
     if (!listener_.valid()) {
@@ -80,10 +91,6 @@ Server::Server(Store& store, std::uint16_t port, Aof* aof) : store_(store), aof_
     const int yes = 1;
     ::setsockopt(listener_.fd(), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
     if (::bind(listener_.fd(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         fail("bind");
     }
@@ -140,6 +147,7 @@ void Server::run() {
             maybe_rewrite_aof();
         }
         flush_followers();
+        close_stale_unauthenticated();
 
         // Close everything that was marked during this pass, then (re)connect to the leader.
         // Doing both here, after all events were handled, means a reused fd number can never
@@ -166,10 +174,32 @@ void Server::maybe_rewrite_aof() {
     }
 }
 
+// Anonymous connections cost a file descriptor and some memory. Without a deadline, anyone could
+// open thousands of silent ones and fill kMaxClients, locking real clients out.
+void Server::close_stale_unauthenticated() {
+    if (!auth_.required()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_sweep_) {
+        return;
+    }
+    next_sweep_ = now + std::chrono::milliseconds(kEpollTimeoutMs);
+    for (const auto& [fd, conn] : conns_) {
+        if (conn.role == Role::kClient && !conn.authenticated &&
+            now - conn.accepted_at >= auth_timeout_) {
+            doomed_.push_back(fd);
+        }
+    }
+}
+
 void Server::accept_clients() {
     // Several clients may be waiting, so accept until there are none left.
     for (;;) {
-        const int fd = ::accept4(listener_.fd(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        sockaddr_in peer_addr{};
+        socklen_t peer_len = sizeof(peer_addr);
+        const int fd = ::accept4(listener_.fd(), reinterpret_cast<sockaddr*>(&peer_addr),
+                                 &peer_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
@@ -192,6 +222,11 @@ void Server::accept_clients() {
         Connection conn;
         conn.sock = std::move(sock);
         conn.events = kIn;
+        conn.accepted_at = std::chrono::steady_clock::now();
+        char text[INET_ADDRSTRLEN] = {};
+        conn.peer = ::inet_ntop(AF_INET, &peer_addr.sin_addr, text, sizeof(text)) != nullptr
+                        ? text
+                        : "?";
         conns_.emplace(fd, std::move(conn));
     }
 }
@@ -244,6 +279,21 @@ bool Server::read_some(Connection& c) {
         return true;  // a follower has nothing to tell us yet: ignore its bytes
     }
     if (c.role == Role::kLeaderLink) {
+        if (link_ == LinkState::kWaiting && read_buf_[0] == '-') {
+            // The leader answered our SYNC with an error (wrong or missing password, say).
+            // Show its message instead of a confusing parse error.
+            std::string line(read_buf_.data(), static_cast<std::size_t>(n));
+            const std::size_t end = line.find("\r\n");
+            if (end != std::string::npos) {
+                line.resize(end);
+            }
+            if (!failure_logged_) {
+                std::cerr << "replication: the leader refused the sync: " << line
+                          << " (retrying every second)" << std::endl;
+                failure_logged_ = true;
+            }
+            return false;
+        }
         link_ = LinkState::kStreaming;
         failure_logged_ = false;
     }
@@ -276,8 +326,8 @@ bool Server::process_input(Connection& c) {
             continue;
         }
         c.out += handle_command(c, r.command);
-        if (c.role == Role::kFollower) {
-            pos = c.in.size();  // it just became a follower: ignore anything else it sent
+        if (c.role == Role::kFollower || c.closing) {
+            pos = c.in.size();  // it became a follower, or we are hanging up: ignore the rest
             break;
         }
         if (c.out.size() > kMaxOutputBytes) {
@@ -285,6 +335,14 @@ bool Server::process_input(Connection& c) {
         }
     }
     c.in.erase(0, pos);  // erase once, not once per command
+
+    if (c.role == Role::kClient && auth_.required() && !c.authenticated &&
+        c.in.size() > kMaxUnauthInputBytes) {
+        c.out += resp::error("too much data before authentication");
+        c.closing = true;
+        c.in.clear();
+        return true;
+    }
     if (c.in.size() > kMaxInputBytes) {
         if (c.role == Role::kLeaderLink) {
             return false;
@@ -297,6 +355,21 @@ bool Server::process_input(Connection& c) {
 }
 
 std::string Server::handle_command(Connection& c, const Command& cmd) {
+    const std::string name = cmd.empty() ? std::string() : upper(cmd[0]);
+    if (name == "AUTH") {
+        return cmd_auth(c, cmd);
+    }
+    if (auth_.required() && !c.authenticated) {
+        if (name == "SYNC" && cmd.size() == 2) {
+            // A follower presents its password together with the sync request.
+            std::string refusal = try_authenticate(c, cmd[1]);
+            if (!refusal.empty()) {
+                return refusal;
+            }
+            return cmd_sync(c, Command{"SYNC"});
+        }
+        return resp::error_code("NOAUTH", "Authentication required.");
+    }
     if (auto reply = server_command(c, cmd)) {
         return std::move(*reply);
     }
@@ -314,9 +387,9 @@ void Server::apply_from_leader(const Command& cmd) {
     propagate(effect);
 }
 
-// Sends one state change to the AOF and to every follower. Any key that expired while running
-// the command is announced as DEL *before* the command's own effect, so a replay or a follower
-// sees the same order of events as the original run did.
+// Sends one state change to the AOF and to every follower. Any key that expired or was evicted
+// while running the command is announced as DEL *before* the command's own effect, so a replay
+// or a follower sees the same order of events as the original run did.
 void Server::propagate(const Command& effect) {
     std::string bytes;
     for (const std::string& key : store_.take_expired()) {
@@ -416,6 +489,41 @@ void Server::close_connection(int fd) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------------------
+
+// Checks a password guess for this connection. Returns "" on success, otherwise the error reply.
+std::string Server::try_authenticate(Connection& c, std::string_view password) {
+    switch (auth_.attempt(password, std::chrono::steady_clock::now())) {
+        case AuthResult::kOk:
+            c.authenticated = true;
+            return {};
+        case AuthResult::kThrottled:
+            c.closing = true;
+            return resp::error("too many authentication failures, try again later");
+        case AuthResult::kWrongPassword:
+            break;
+    }
+    ++auth_failures_total_;
+    std::cerr << "auth: failed attempt from " << c.peer << std::endl;  // never log the guess
+    if (++c.auth_failures >= kMaxAuthFailures) {
+        c.closing = true;
+    }
+    return resp::error_code("WRONGPASS", "invalid password");
+}
+
+std::string Server::cmd_auth(Connection& c, const Command& cmd) {
+    if (cmd.size() != 2) {
+        return resp::error("wrong number of arguments for 'AUTH' command");
+    }
+    if (!auth_.required()) {
+        return resp::error("AUTH called without any password configured");
+    }
+    std::string refusal = try_authenticate(c, cmd[1]);
+    return refusal.empty() ? resp::simple_string("OK") : refusal;
+}
+
+// ---------------------------------------------------------------------------------------
 // Commands that need server state
 // ---------------------------------------------------------------------------------------
 
@@ -457,8 +565,9 @@ std::string Server::cmd_rewriteaof(const Command& cmd) {
 // A follower asks for our data. The "reply" is FLUSHALL + a full snapshot; from this moment on
 // the connection also receives every change we make. Because the loop is single-threaded,
 // nothing can change between building the snapshot and registering the follower.
+// `SYNC <password>` is accepted too: an unauthenticated follower presents its password there.
 std::string Server::cmd_sync(Connection& c, const Command& cmd) {
-    if (cmd.size() != 1) {
+    if (cmd.size() > 2) {
         return resp::error("wrong number of arguments for 'SYNC' command");
     }
     std::string payload = resp::command({"FLUSHALL"});
@@ -517,6 +626,9 @@ std::string Server::cmd_info() const {
     out += "maxmemory:" + std::to_string(store_.maxmemory()) + "\r\n";
     out += std::string("maxmemory_policy:") + policy_name(store_.eviction_policy()) + "\r\n";
     out += "evicted_keys:" + std::to_string(store_.evicted_keys()) + "\r\n";
+    out += "\r\n# Security\r\n";
+    out += std::string("auth_required:") + (auth_.required() ? "yes" : "no") + "\r\n";
+    out += "auth_failures_total:" + std::to_string(auth_failures_total_) + "\r\n";
     return resp::bulk_string(out);
 }
 
@@ -596,6 +708,7 @@ void Server::connect_to_leader() {
     conn.sock = std::move(sock);
     conn.role = Role::kLeaderLink;
     conn.events = kOut;
+    conn.accepted_at = std::chrono::steady_clock::now();
     conns_.emplace(fd, std::move(conn));
     leader_fd_ = fd;
     link_ = LinkState::kConnecting;
@@ -632,7 +745,8 @@ void Server::finish_connect(int fd, Connection& c, std::uint32_t events) {
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
     ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 
-    c.out = resp::command({"SYNC"});
+    c.out = leader_password_.empty() ? resp::command({"SYNC"})
+                                     : resp::command({"SYNC", leader_password_});
     c.out_pos = 0;
     link_ = LinkState::kWaiting;
     if (!flush(c) || !update_interest(fd, c)) {

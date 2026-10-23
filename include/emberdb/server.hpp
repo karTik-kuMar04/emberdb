@@ -9,10 +9,12 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "emberdb/resp_parser.hpp"
+#include "emberdb/security.hpp"
 #include "emberdb/socket.hpp"
 #include "emberdb/store.hpp"
 
@@ -26,11 +28,22 @@ class Server {
 public:
     // Pass port 0 to let the OS pick a free port (used by tests).
     // `aof` is optional: when set, every state change is logged to it.
-    Server(Store& store, std::uint16_t port, Aof* aof = nullptr);
+    // `bind_address` is an IPv4 address or "localhost". The default only accepts connections
+    // from this machine; use "0.0.0.0" to accept them from anywhere.
+    Server(Store& store, std::uint16_t port, Aof* aof = nullptr,
+           const std::string& bind_address = "127.0.0.1");
 
     void run();                                          // blocks until stop()
     void stop() noexcept { stopping_.store(true); }      // safe from a signal handler
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+
+    // Clients must send AUTH <password> before anything else. Empty turns it off.
+    // Call before run().
+    void set_password(std::string password) { auth_ = Authenticator(std::move(password)); }
+    // The password to present to our leader when following it. Call before run().
+    void set_leader_password(std::string password) { leader_password_ = std::move(password); }
+    // How long a connection may stay unauthenticated (default 10 seconds).
+    void set_auth_timeout(std::chrono::milliseconds timeout) noexcept { auth_timeout_ = timeout; }
 
     // Makes this server follow host:port (IPv4 address or "localhost"). Returns an error message,
     // or an empty string on success. The connection is made from inside run().
@@ -46,11 +59,15 @@ private:
     struct Connection {
         Socket sock;
         Role role = Role::kClient;
+        std::string peer;          // remote IP, for the log
         std::string in;            // bytes received, not yet parsed
         std::string out;           // reply bytes not yet fully sent
         std::size_t out_pos = 0;   // how much of `out` is already sent
         std::uint32_t events = 0;  // epoll events we are currently watching
         bool closing = false;      // close once `out` has drained
+        bool authenticated = false;
+        int auth_failures = 0;
+        std::chrono::steady_clock::time_point accepted_at{};
     };
 
     void accept_clients();
@@ -66,9 +83,12 @@ private:
     void propagate(const Command& effect);
     void flush_followers();
     void maybe_rewrite_aof();
+    void close_stale_unauthenticated();
 
     // Commands that need server state, so the dispatcher can't run them.
     std::optional<std::string> server_command(Connection& c, const Command& cmd);
+    std::string cmd_auth(Connection& c, const Command& cmd);
+    std::string try_authenticate(Connection& c, std::string_view password);
     std::string cmd_rewriteaof(const Command& cmd);
     std::string cmd_sync(Connection& c, const Command& cmd);
     std::string cmd_replicaof(const Command& cmd);
@@ -89,6 +109,12 @@ private:
     std::atomic<bool> stopping_{false};
     std::unordered_map<int, Connection> conns_;
     std::array<char, 16384> read_buf_{};
+
+    Authenticator auth_;
+    std::size_t auth_failures_total_ = 0;
+    std::chrono::milliseconds auth_timeout_{10000};
+    std::chrono::steady_clock::time_point next_sweep_{};
+    std::string leader_password_;
 
     std::vector<int> followers_;  // fds of connections that follow us
     std::vector<int> doomed_;     // fds to close at the end of the current loop pass

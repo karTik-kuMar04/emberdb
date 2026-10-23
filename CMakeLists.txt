@@ -13,6 +13,8 @@ add_library(emberdb_lib
     src/resp_writer.cpp
     src/dispatcher.cpp
     src/snapshot.cpp
+    src/security.cpp
+    src/config.cpp
 )
 target_include_directories(emberdb_lib PUBLIC include)
 target_compile_options(emberdb_lib PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)

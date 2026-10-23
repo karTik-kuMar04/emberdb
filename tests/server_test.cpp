@@ -511,3 +511,274 @@ TEST(ServerEviction, NoEvictionRepliesOomWhenFull) {
     server.stop();
     t.join();
 }
+
+#include <cerrno>
+
+#include "emberdb/security.hpp"
+
+namespace {
+
+// Sends one command on an existing connection and returns the first chunk of the reply.
+std::string call(int fd, const emberdb::Command& cmd) {
+    send_all(fd, emberdb::resp::command(cmd));
+    char buf[4096];
+    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string();
+}
+
+// Opens a connection and authenticates it.
+emberdb::Socket login(std::uint16_t port, const std::string& password) {
+    emberdb::Socket c(dial(port));
+    if (c.valid()) {
+        call(c.fd(), {"AUTH", password});
+    }
+    return c;
+}
+
+const std::string kNoAuth = "-NOAUTH Authentication required.\r\n";
+const std::string kWrongPass = "-WRONGPASS invalid password\r\n";
+
+class AuthTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        server_ = std::make_unique<emberdb::Server>(store_, 0);
+        server_->set_password("s3cret");
+        server_->set_auth_timeout(std::chrono::milliseconds(600));
+        thread_ = std::thread([this] { server_->run(); });
+    }
+    void TearDown() override {
+        server_->stop();
+        thread_.join();
+    }
+    std::uint16_t port() const { return server_->port(); }
+
+    emberdb::Store store_;
+    std::unique_ptr<emberdb::Server> server_;
+    std::thread thread_;
+};
+
+}  // namespace
+
+TEST_F(AuthTest, NoCommandWorksBeforeAuth) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"PING"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"GET", "k"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"SET", "k", "v"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"INFO"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"FLUSHALL"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"REPLICAOF", "NO", "ONE"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"REWRITEAOF"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"SYNC"}), kNoAuth);
+}
+
+TEST_F(AuthTest, WrongPasswordIsRejected) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"AUTH", "nope"}), kWrongPass);
+    EXPECT_EQ(call(c.fd(), {"PING"}), kNoAuth);
+}
+
+TEST_F(AuthTest, CorrectPasswordUnlocksTheConnection) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"SET", "k", "v"}), kNoAuth);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "s3cret"}), "+OK\r\n");
+    EXPECT_EQ(call(c.fd(), {"PING"}), "+PONG\r\n");
+    EXPECT_EQ(call(c.fd(), {"GET", "k"}), "$-1\r\n");  // the refused SET never ran
+    EXPECT_EQ(call(c.fd(), {"SET", "k", "v"}), "+OK\r\n");
+    EXPECT_EQ(call(c.fd(), {"GET", "k"}), "$1\r\nv\r\n");
+}
+
+TEST_F(AuthTest, AuthDoesNotCarryOverToOtherConnections) {
+    emberdb::Socket a = login(port(), "s3cret");
+    emberdb::Socket b(dial(port()));
+    ASSERT_TRUE(a.valid());
+    ASSERT_TRUE(b.valid());
+    EXPECT_EQ(call(a.fd(), {"PING"}), "+PONG\r\n");
+    EXPECT_EQ(call(b.fd(), {"PING"}), kNoAuth);
+}
+
+TEST_F(AuthTest, ThreeWrongPasswordsCloseTheConnection) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"AUTH", "a"}), kWrongPass);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "b"}), kWrongPass);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "c"}), kWrongPass);
+    char byte = 0;
+    EXPECT_EQ(::recv(c.fd(), &byte, 1, 0), 0);  // the server hung up
+}
+
+TEST_F(AuthTest, AuthChecksArgumentCount) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    const std::string expected = "-ERR wrong number of arguments for 'AUTH' command\r\n";
+    EXPECT_EQ(call(c.fd(), {"AUTH"}), expected);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "a", "b"}), expected);
+}
+
+TEST_F(AuthTest, GlobalThrottleBlocksGuessing) {
+    // Ten wrong guesses (three per connection) use up the budget for this one-second window.
+    int guesses = 0;
+    while (guesses < 10) {
+        emberdb::Socket c(dial(port()));
+        ASSERT_TRUE(c.valid());
+        for (int i = 0; i < 3 && guesses < 10; ++i, ++guesses) {
+            EXPECT_EQ(call(c.fd(), {"AUTH", "bad"}), kWrongPass);
+        }
+    }
+    emberdb::Socket blocked(dial(port()));
+    ASSERT_TRUE(blocked.valid());
+    // Even the right password is refused during the lockout.
+    EXPECT_EQ(call(blocked.fd(), {"AUTH", "s3cret"}),
+              "-ERR too many authentication failures, try again later\r\n");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    emberdb::Socket later(dial(port()));
+    ASSERT_TRUE(later.valid());
+    EXPECT_EQ(call(later.fd(), {"AUTH", "s3cret"}), "+OK\r\n");
+}
+
+TEST_F(AuthTest, IdleUnauthenticatedConnectionIsClosed) {
+    emberdb::Socket idle(dial(port()));
+    ASSERT_TRUE(idle.valid());
+    emberdb::Socket authed = login(port(), "s3cret");
+    ASSERT_TRUE(authed.valid());
+    char byte = 0;
+    EXPECT_EQ(::recv(idle.fd(), &byte, 1, 0), 0);  // closed by the server after the timeout
+    EXPECT_EQ(call(authed.fd(), {"PING"}), "+PONG\r\n");  // the authenticated one is left alone
+}
+
+TEST_F(AuthTest, OversizedPreAuthInputIsRejected) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    send_all(c.fd(), "*1\r\n$100000\r\n" + std::string(20000, 'x'));
+    std::string got;
+    char buf[256];
+    ssize_t n = 0;
+    while ((n = ::recv(c.fd(), buf, sizeof(buf), 0)) > 0) {
+        got.append(buf, static_cast<std::size_t>(n));
+    }
+    EXPECT_TRUE(n == 0 || errno == ECONNRESET);  // closed, cleanly or by a reset
+    EXPECT_TRUE(got.empty() || got == "-ERR too much data before authentication\r\n");
+}
+
+TEST_F(AuthTest, SyncCanCarryThePassword) {
+    emberdb::Socket bad(dial(port()));
+    ASSERT_TRUE(bad.valid());
+    EXPECT_EQ(call(bad.fd(), {"SYNC", "wrong"}), kWrongPass);
+
+    emberdb::Socket good(dial(port()));
+    ASSERT_TRUE(good.valid());
+    send_all(good.fd(), emberdb::resp::command({"SYNC", "s3cret"}));
+    EXPECT_EQ(recv_n(good.fd(), 18), "*1\r\n$8\r\nFLUSHALL\r\n");  // the stream starts
+}
+
+TEST_F(AuthTest, InfoReportsAuthState) {
+    emberdb::Socket c(dial(port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"AUTH", "wrong"}), kWrongPass);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "s3cret"}), "+OK\r\n");
+    const std::string info = call(c.fd(), {"INFO"});
+    EXPECT_TRUE(contains(info, "auth_required:yes"));
+    EXPECT_TRUE(contains(info, "auth_failures_total:1"));
+}
+
+TEST(ServerSecurity, AuthWithoutPasswordConfiguredIsAnError) {
+    emberdb::Store store;
+    emberdb::Server server(store, 0);
+    std::thread t([&] { server.run(); });
+    EXPECT_EQ(ask(server.port(), {"AUTH", "x"}),
+              "-ERR AUTH called without any password configured\r\n");
+    EXPECT_EQ(ask(server.port(), {"PING"}), "+PONG\r\n");  // no password means no gate
+    server.stop();
+    t.join();
+}
+
+TEST(ServerSecurity, InvalidBindAddressThrows) {
+    emberdb::Store store;
+    EXPECT_THROW({ emberdb::Server server(store, 0, nullptr, "not-an-ip"); }, std::runtime_error);
+}
+
+TEST(ServerSecurity, BindAddressIsHonored) {
+    emberdb::Store store;
+    emberdb::Server server(store, 0, nullptr, "127.0.0.2");
+    std::thread t([&] { server.run(); });
+
+    EXPECT_LT(dial(server.port()), 0);  // 127.0.0.1 is not the address we listen on
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(server.port());
+    ::inet_pton(AF_INET, "127.0.0.2", &addr.sin_addr);
+    EXPECT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ::close(fd);
+
+    server.stop();
+    t.join();
+}
+
+namespace {
+
+class ReplicationAuthTest : public ::testing::Test {
+protected:
+    void start(const std::string& leader_password, const std::string& masterauth) {
+        leader_ = std::make_unique<emberdb::Server>(leader_store_, 0);
+        leader_->set_password(leader_password);
+        follower_ = std::make_unique<emberdb::Server>(follower_store_, 0);
+        follower_->set_leader_password(masterauth);
+        leader_thread_ = std::thread([this] { leader_->run(); });
+        follower_thread_ = std::thread([this] { follower_->run(); });
+    }
+    void TearDown() override {
+        if (leader_) {
+            leader_->stop();
+        }
+        if (follower_) {
+            follower_->stop();
+        }
+        if (leader_thread_.joinable()) {
+            leader_thread_.join();
+        }
+        if (follower_thread_.joinable()) {
+            follower_thread_.join();
+        }
+    }
+    std::string follow() {
+        return ask(follower_->port(),
+                   {"REPLICAOF", "127.0.0.1", std::to_string(leader_->port())});
+    }
+
+    emberdb::Store leader_store_;
+    emberdb::Store follower_store_;
+    std::unique_ptr<emberdb::Server> leader_;
+    std::unique_ptr<emberdb::Server> follower_;
+    std::thread leader_thread_;
+    std::thread follower_thread_;
+};
+
+}  // namespace
+
+TEST_F(ReplicationAuthTest, FollowerWithTheRightPasswordSyncs) {
+    start("lead-pw", "lead-pw");
+    emberdb::Socket l = login(leader_->port(), "lead-pw");
+    ASSERT_TRUE(l.valid());
+    EXPECT_EQ(call(l.fd(), {"SET", "a", "1"}), "+OK\r\n");
+
+    EXPECT_EQ(follow(), "+OK\r\n");
+    EXPECT_TRUE(eventually([&] { return ask(follower_->port(), {"GET", "a"}) == "$1\r\n1\r\n"; }));
+    EXPECT_EQ(call(l.fd(), {"SET", "b", "2"}), "+OK\r\n");
+    EXPECT_TRUE(eventually([&] { return ask(follower_->port(), {"GET", "b"}) == "$1\r\n2\r\n"; }));
+}
+
+TEST_F(ReplicationAuthTest, FollowerWithTheWrongPasswordIsRefused) {
+    start("lead-pw", "not-the-password");
+    EXPECT_EQ(follow(), "+OK\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));  // long enough for a retry
+
+    EXPECT_TRUE(contains(ask(follower_->port(), {"INFO"}), "master_link_status:down"));
+    emberdb::Socket l = login(leader_->port(), "lead-pw");
+    ASSERT_TRUE(l.valid());
+    EXPECT_TRUE(contains(call(l.fd(), {"INFO"}), "connected_slaves:0"));
+}
