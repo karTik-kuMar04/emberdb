@@ -13,10 +13,13 @@
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 #include "emberdb/aof.hpp"
 #include "emberdb/dispatcher.hpp"
+#include "emberdb/http.hpp"
 #include "emberdb/int_parse.hpp"
+#include "emberdb/metrics.hpp"
 #include "emberdb/resp_parser.hpp"
 #include "emberdb/resp_writer.hpp"
 #include "emberdb/snapshot.hpp"
@@ -38,6 +41,12 @@ constexpr auto kReconnectDelay = std::chrono::seconds(1);
 // An anonymous client may buffer this much before it has to log in, enough for any AUTH command.
 constexpr std::size_t kMaxUnauthInputBytes = 16UL * 1024;
 constexpr int kMaxAuthFailures = 3;  // wrong guesses allowed on one connection
+
+// The metrics endpoint is for one scraper, so it gets very few connections.
+constexpr std::size_t kMaxHttpClients = 16;
+constexpr int kMetricsBacklog = 16;
+constexpr const char* kTextPlain = "text/plain; charset=utf-8";
+constexpr const char* kPrometheusType = "text/plain; version=0.0.4; charset=utf-8";
 
 constexpr std::uint32_t kIn = EPOLLIN;
 constexpr std::uint32_t kOut = EPOLLOUT;
@@ -71,10 +80,26 @@ bool make_address(const std::string& host, std::uint16_t port, sockaddr_in& out)
     return ::inet_pton(AF_INET, ip.c_str(), &out.sin_addr) == 1;
 }
 
+std::uint64_t nanos_since(std::chrono::steady_clock::time_point start) {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+    return ns > 0 ? static_cast<std::uint64_t>(ns) : 0;
+}
+
+// The names that get their own metrics series: everything the dispatcher knows, plus the commands
+// the server handles itself. Anything else is counted as "other".
+std::vector<std::string> all_command_names() {
+    std::vector<std::string> names = command_names();
+    for (const char* extra : {"AUTH", "SYNC", "REPLICAOF", "INFO", "REWRITEAOF"}) {
+        names.emplace_back(extra);
+    }
+    return names;
+}
+
 }  // namespace
 
 Server::Server(Store& store, std::uint16_t port, Aof* aof, const std::string& bind_address)
-    : store_(store), aof_(aof) {
+    : store_(store), aof_(aof), metrics_(all_command_names()) {
     // Keys that expire or get evicted are announced (to the AOF and to followers) as DEL records.
     store_.set_track_expired(true);
 
@@ -115,6 +140,39 @@ Server::Server(Store& store, std::uint16_t port, Aof* aof, const std::string& bi
     }
 }
 
+void Server::enable_metrics(const std::string& bind_address, std::uint16_t port) {
+    if (metrics_listener_.valid()) {
+        throw std::runtime_error("the metrics endpoint is already enabled");
+    }
+    sockaddr_in addr{};
+    if (!make_address(bind_address, port, addr)) {
+        throw std::runtime_error("invalid metrics bind address '" + bind_address +
+                                 "' (use an IPv4 address or localhost)");
+    }
+    Socket sock(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    if (!sock.valid()) {
+        fail("metrics socket");
+    }
+    const int yes = 1;
+    ::setsockopt(sock.fd(), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    if (::bind(sock.fd(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        fail("metrics bind");
+    }
+    if (::listen(sock.fd(), kMetricsBacklog) < 0) {
+        fail("metrics listen");
+    }
+    sockaddr_in bound{};
+    socklen_t len = sizeof(bound);
+    if (::getsockname(sock.fd(), reinterpret_cast<sockaddr*>(&bound), &len) < 0) {
+        fail("metrics getsockname");
+    }
+    if (!epoll_update(epoll_.fd(), EPOLL_CTL_ADD, sock.fd(), kIn)) {
+        fail("epoll_ctl(metrics listener)");
+    }
+    metrics_port_ = ntohs(bound.sin_port);
+    metrics_listener_ = std::move(sock);
+}
+
 void Server::run() {
     std::array<epoll_event, 128> events{};
     int timeout_ms = kEpollTimeoutMs;
@@ -127,10 +185,13 @@ void Server::run() {
             }
             fail("epoll_wait");
         }
+        const auto busy_from = std::chrono::steady_clock::now();  // from here on we are working
         for (int i = 0; i < n; ++i) {
             const epoll_event& ev = events[static_cast<std::size_t>(i)];
             if (ev.data.fd == listener_.fd()) {
                 accept_clients();
+            } else if (metrics_listener_.valid() && ev.data.fd == metrics_listener_.fd()) {
+                accept_http_clients();
             } else {
                 handle_event(ev.data.fd, ev.events);
             }
@@ -147,7 +208,7 @@ void Server::run() {
             maybe_rewrite_aof();
         }
         flush_followers();
-        close_stale_unauthenticated();
+        close_stale_connections();
 
         // Close everything that was marked during this pass, then (re)connect to the leader.
         // Doing both here, after all events were handled, means a reused fd number can never
@@ -157,6 +218,8 @@ void Server::run() {
         }
         doomed_.clear();
         replication_cron();
+
+        metrics_.loop_busy_ns += nanos_since(busy_from);
     }
 }
 
@@ -167,17 +230,20 @@ void Server::maybe_rewrite_aof() {
     const std::size_t before = aof_->size();
     try {
         aof_->rewrite(store_);
+        ++metrics_.aof_rewrites;
         std::cout << "AOF rewritten: " << before << " -> " << aof_->size() << " bytes"
                   << std::endl;
     } catch (const std::exception& e) {
+        ++metrics_.aof_rewrite_failures;
         std::cerr << "AOF rewrite failed (retrying in 60s): " << e.what() << std::endl;
     }
 }
 
 // Anonymous connections cost a file descriptor and some memory. Without a deadline, anyone could
-// open thousands of silent ones and fill kMaxClients, locking real clients out.
-void Server::close_stale_unauthenticated() {
-    if (!auth_.required()) {
+// open thousands of silent ones and fill kMaxClients, locking real clients out. The same goes for
+// HTTP clients that never finish their request.
+void Server::close_stale_connections() {
+    if (!auth_.required() && http_clients_ == 0) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -186,9 +252,14 @@ void Server::close_stale_unauthenticated() {
     }
     next_sweep_ = now + std::chrono::milliseconds(kEpollTimeoutMs);
     for (const auto& [fd, conn] : conns_) {
-        if (conn.role == Role::kClient && !conn.authenticated &&
-            now - conn.accepted_at >= auth_timeout_) {
+        if (conn.role == Role::kHttp) {
+            if (now - conn.accepted_at >= http_timeout_) {
+                doomed_.push_back(fd);
+            }
+        } else if (auth_.required() && conn.role == Role::kClient && !conn.authenticated &&
+                   now - conn.accepted_at >= auth_timeout_) {
             doomed_.push_back(fd);
+            metrics_.connection_dropped(DropReason::kAuthTimeout);
         }
     }
 }
@@ -212,6 +283,7 @@ void Server::accept_clients() {
         }
         Socket sock(fd);  // from here on, closed automatically on any early exit
         if (conns_.size() >= kMaxClients) {
+            metrics_.connection_dropped(DropReason::kMaxClients);
             continue;  // too many clients: drop this one
         }
         const int yes = 1;
@@ -228,6 +300,38 @@ void Server::accept_clients() {
                         ? text
                         : "?";
         conns_.emplace(fd, std::move(conn));
+        ++metrics_.connections_accepted;
+    }
+}
+
+void Server::accept_http_clients() {
+    for (;;) {
+        const int fd = ::accept4(metrics_listener_.fd(), nullptr, nullptr,
+                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
+            }
+            std::cerr << "metrics accept failed: " << std::strerror(errno) << "\n";
+            return;
+        }
+        Socket sock(fd);
+        if (http_clients_ >= kMaxHttpClients) {
+            continue;  // the extra connection is closed right away
+        }
+        if (!epoll_update(epoll_.fd(), EPOLL_CTL_ADD, fd, kIn)) {
+            continue;
+        }
+        Connection conn;
+        conn.sock = std::move(sock);
+        conn.role = Role::kHttp;
+        conn.events = kIn;
+        conn.accepted_at = std::chrono::steady_clock::now();
+        conns_.emplace(fd, std::move(conn));
+        ++http_clients_;
     }
 }
 
@@ -238,6 +342,10 @@ void Server::handle_event(int fd, std::uint32_t events) {
     }
     Connection& c = it->second;
 
+    if (c.role == Role::kHttp) {
+        handle_http_event(fd, c, events);
+        return;
+    }
     if (c.role == Role::kLeaderLink && link_ == LinkState::kConnecting) {
         finish_connect(fd, c, events);
         return;
@@ -262,6 +370,100 @@ void Server::handle_event(int fd, std::uint32_t events) {
     }
 }
 
+void Server::handle_http_event(int fd, Connection& c, std::uint32_t events) {
+    bool ok = (events & kErr) == 0;
+    if (ok && !c.closing && (events & (kIn | kHup)) != 0) {
+        ok = read_http(c);
+    }
+    if (ok) {
+        ok = flush(c);
+    }
+    if (!ok || (c.closing && c.out.empty())) {
+        close_connection(fd);
+        return;
+    }
+    if (!update_interest(fd, c)) {
+        close_connection(fd);
+    }
+}
+
+// Reads an HTTP request and queues the answer. Every connection serves exactly one request.
+bool Server::read_http(Connection& c) {
+    const ssize_t n = ::recv(c.sock.fd(), read_buf_.data(), read_buf_.size(), 0);
+    if (n == 0) {
+        return false;  // the client left before finishing its request
+    }
+    if (n < 0) {
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+    }
+    c.in.append(read_buf_.data(), static_cast<std::size_t>(n));
+
+    const HttpParseResult parsed = parse_http_request(c.in);
+    if (parsed.status == HttpParse::kIncomplete) {
+        if (c.in.size() > kMaxHttpRequestBytes) {
+            c.out = http_response(431, kTextPlain, "request too large\n");
+            c.closing = true;
+            c.in.clear();
+        }
+        return true;
+    }
+    c.in.clear();
+    c.out = parsed.status == HttpParse::kBad ? http_response(400, kTextPlain, "bad request\n")
+                                             : http_reply(parsed.request);
+    c.closing = true;  // one request per connection: close once the answer is sent
+    return true;
+}
+
+std::string Server::http_reply(const HttpRequest& request) {
+    if (request.method != "GET") {
+        return http_response(405, kTextPlain, "method not allowed\n", "Allow: GET\r\n");
+    }
+    if (request.path == "/metrics") {
+        ++metrics_.scrapes;
+        return http_response(200, kPrometheusType, render_metrics());
+    }
+    if (request.path == "/healthz") {
+        return http_response(200, kTextPlain, "ok\n");  // the loop is alive, since it answered
+    }
+    if (request.path == "/readyz") {
+        const bool ready = repl_host_.empty() || link_ == LinkState::kStreaming;
+        return ready ? http_response(200, kTextPlain, "ready\n")
+                     : http_response(503, kTextPlain, "not ready: the replication link is down\n");
+    }
+    return http_response(404, kTextPlain, "not found\n");
+}
+
+std::string Server::render_metrics() const {
+    MetricsSnapshot s;
+    s.uptime_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at_).count();
+    s.start_time_unix = started_unix_;
+    for (const auto& entry : conns_) {
+        if (entry.second.role == Role::kClient) {
+            ++s.connected_clients;
+        }
+    }
+    s.connected_followers = followers_.size();
+    for (const int fd : followers_) {
+        const auto it = conns_.find(fd);
+        if (it != conns_.end()) {
+            s.follower_max_pending_bytes =
+                std::max(s.follower_max_pending_bytes, it->second.out.size() - it->second.out_pos);
+        }
+    }
+    s.keys = store_.size();
+    s.used_memory = store_.used_memory();
+    s.max_memory = store_.maxmemory();
+    s.expired_keys = store_.expired_keys();
+    s.evicted_keys = store_.evicted_keys();
+    s.aof_enabled = aof_ != nullptr;
+    s.aof_size_bytes = aof_ != nullptr ? aof_->size() : 0;
+    s.auth_required = auth_.required();
+    s.is_follower = !repl_host_.empty();
+    s.replication_link_up = link_ == LinkState::kStreaming;
+    return render_prometheus(metrics_, s);
+}
+
 bool Server::read_some(Connection& c) {
     const ssize_t n = ::recv(c.sock.fd(), read_buf_.data(), read_buf_.size(), 0);
     if (n == 0) {
@@ -275,6 +477,7 @@ bool Server::read_some(Connection& c) {
     if (n < 0) {
         return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
     }
+    metrics_.bytes_read += static_cast<std::uint64_t>(n);
     if (c.role == Role::kFollower) {
         return true;  // a follower has nothing to tell us yet: ignore its bytes
     }
@@ -314,6 +517,7 @@ bool Server::process_input(Connection& c) {
                 std::cerr << "replication: protocol error from leader: " << r.error << std::endl;
                 return false;
             }
+            metrics_.connection_dropped(DropReason::kProtocolError);
             c.out += resp::error("Protocol error: " + r.error);
             c.closing = true;
             pos = c.in.size();  // discard the rest of the garbage
@@ -331,6 +535,7 @@ bool Server::process_input(Connection& c) {
             break;
         }
         if (c.out.size() > kMaxOutputBytes) {
+            metrics_.connection_dropped(DropReason::kOutputLimit);
             return false;  // client pipelines but never reads replies
         }
     }
@@ -354,8 +559,17 @@ bool Server::process_input(Connection& c) {
     return true;
 }
 
+// Times the command and counts it. The time is what the server spent, so network time is
+// not included.
 std::string Server::handle_command(Connection& c, const Command& cmd) {
+    const auto started = std::chrono::steady_clock::now();
     const std::string name = cmd.empty() ? std::string() : upper(cmd[0]);
+    std::string reply = dispatch_command(c, cmd, name);
+    metrics_.record_command(name, nanos_since(started), !reply.empty() && reply.front() == '-');
+    return reply;
+}
+
+std::string Server::dispatch_command(Connection& c, const Command& cmd, const std::string& name) {
     if (name == "AUTH") {
         return cmd_auth(c, cmd);
     }
@@ -370,7 +584,7 @@ std::string Server::handle_command(Connection& c, const Command& cmd) {
         }
         return resp::error_code("NOAUTH", "Authentication required.");
     }
-    if (auto reply = server_command(c, cmd)) {
+    if (auto reply = server_command(c, cmd, name)) {
         return std::move(*reply);
     }
     Command effect;
@@ -385,6 +599,7 @@ void Server::apply_from_leader(const Command& cmd) {
     Command effect;
     static_cast<void>(execute(store_, cmd, &effect));
     propagate(effect);
+    ++metrics_.replicated_commands_applied;
 }
 
 // Sends one state change to the AOF and to every follower. Any key that expired or was evicted
@@ -411,8 +626,10 @@ void Server::propagate(const Command& effect) {
         }
         Connection& f = it->second;
         f.out += bytes;
-        if (f.out.size() - f.out_pos > kFollowerBufferLimit) {
+        if (f.out.size() - f.out_pos > kFollowerBufferLimit &&
+            std::find(doomed_.begin(), doomed_.end(), fd) == doomed_.end()) {
             doomed_.push_back(fd);  // too far behind: drop it, it will resync from scratch
+            metrics_.connection_dropped(DropReason::kFollowerLag);
         }
     }
 }
@@ -450,6 +667,9 @@ bool Server::flush(Connection& c) {
             return false;
         }
         c.out_pos += static_cast<std::size_t>(n);
+        if (c.role != Role::kHttp) {
+            metrics_.bytes_written += static_cast<std::uint64_t>(n);
+        }
     }
     if (c.out_pos == c.out.size()) {
         c.out.clear();
@@ -485,7 +705,13 @@ void Server::close_connection(int fd) {
         retry_at_ = std::chrono::steady_clock::now() + kReconnectDelay;
     }
     followers_.erase(std::remove(followers_.begin(), followers_.end(), fd), followers_.end());
-    conns_.erase(fd);  // Socket's destructor closes the fd, and the kernel drops it from epoll
+    const auto it = conns_.find(fd);
+    if (it != conns_.end()) {
+        if (it->second.role == Role::kHttp) {
+            --http_clients_;
+        }
+        conns_.erase(it);  // Socket's destructor closes the fd, and the kernel drops it from epoll
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -504,7 +730,7 @@ std::string Server::try_authenticate(Connection& c, std::string_view password) {
         case AuthResult::kWrongPassword:
             break;
     }
-    ++auth_failures_total_;
+    ++metrics_.auth_failures;
     std::cerr << "auth: failed attempt from " << c.peer << std::endl;  // never log the guess
     if (++c.auth_failures >= kMaxAuthFailures) {
         c.closing = true;
@@ -527,11 +753,8 @@ std::string Server::cmd_auth(Connection& c, const Command& cmd) {
 // Commands that need server state
 // ---------------------------------------------------------------------------------------
 
-std::optional<std::string> Server::server_command(Connection& c, const Command& cmd) {
-    if (cmd.empty()) {
-        return std::nullopt;
-    }
-    const std::string name = upper(cmd[0]);
+std::optional<std::string> Server::server_command(Connection& c, const Command& cmd,
+                                                  const std::string& name) {
     if (name == "REWRITEAOF") {
         return cmd_rewriteaof(cmd);
     }
@@ -556,7 +779,9 @@ std::string Server::cmd_rewriteaof(const Command& cmd) {
     }
     try {
         aof_->rewrite(store_);
+        ++metrics_.aof_rewrites;
     } catch (const std::exception& e) {
+        ++metrics_.aof_rewrite_failures;
         return resp::error(std::string("AOF rewrite failed: ") + e.what());
     }
     return resp::simple_string("OK");
@@ -577,6 +802,7 @@ std::string Server::cmd_sync(Connection& c, const Command& cmd) {
     }
     c.role = Role::kFollower;
     followers_.push_back(c.sock.fd());
+    ++metrics_.full_syncs_sent;
     return payload;
 }
 
@@ -628,7 +854,7 @@ std::string Server::cmd_info() const {
     out += "evicted_keys:" + std::to_string(store_.evicted_keys()) + "\r\n";
     out += "\r\n# Security\r\n";
     out += std::string("auth_required:") + (auth_.required() ? "yes" : "no") + "\r\n";
-    out += "auth_failures_total:" + std::to_string(auth_failures_total_) + "\r\n";
+    out += "auth_failures_total:" + std::to_string(metrics_.auth_failures) + "\r\n";
     return resp::bulk_string(out);
 }
 

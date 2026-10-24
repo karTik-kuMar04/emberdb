@@ -80,6 +80,7 @@ public:
     [[nodiscard]] std::size_t maxmemory() const noexcept { return max_memory_; }
     [[nodiscard]] EvictionPolicy eviction_policy() const noexcept { return policy_; }
     [[nodiscard]] std::size_t evicted_keys() const noexcept { return evicted_keys_; }
+    [[nodiscard]] std::size_t expired_keys() const noexcept { return expired_keys_; }
     // Called before a command that adds data. Frees memory if the policy allows it. Returns
     // false when the command must be refused (over the limit and nothing may be evicted).
     // Always true while loading, for followers, or when no limit is set.
@@ -138,6 +139,7 @@ private:
     std::size_t used_ = 0;
     std::size_t max_memory_ = 0;
     std::size_t evicted_keys_ = 0;
+    std::size_t expired_keys_ = 0;
     EvictionPolicy policy_ = EvictionPolicy::kNoEviction;
     bool loading_ = false;
     bool track_expired_ = false;

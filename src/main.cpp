@@ -42,6 +42,8 @@ struct Options {
     std::string password;         // empty = no authentication
     std::string leader_password;  // presented to our leader when following it
     bool protected_mode = true;
+    std::string metrics_bind = "127.0.0.1";
+    std::uint16_t metrics_port = 0;  // 0 = no metrics endpoint
 };
 
 std::string read_small_file(const std::string& path) {
@@ -76,6 +78,14 @@ std::string apply_option(Options& opts, std::string_view name, std::string_view 
             return "port must be a number from 1 to 65535";
         }
         opts.port = static_cast<std::uint16_t>(*port);
+    } else if (name == "metrics-port") {
+        const auto port = emberdb::parse_int64(value);
+        if (!port || *port < 1 || *port > 65535) {
+            return "metrics-port must be a number from 1 to 65535";
+        }
+        opts.metrics_port = static_cast<std::uint16_t>(*port);
+    } else if (name == "metrics-bind") {
+        opts.metrics_bind = std::string(value);
     } else if (name == "bind") {
         opts.bind_address = std::string(value);
     } else if (name == "aof") {
@@ -190,8 +200,8 @@ std::string parse_args(int argc, char** argv, Options& opts) {
         }
         const std::string_view name = flag.substr(2);
         char* value_arg = argv[++i];
-        const std::string error = name == "config" ? load_config(opts, value_arg)
-                                                   : apply_option(opts, name, value_arg);
+        const std::string error =
+            name == "config" ? load_config(opts, value_arg) : apply_option(opts, name, value_arg);
         if (!error.empty()) {
             return "--" + std::string(name) + ": " + error;
         }
@@ -209,14 +219,16 @@ int main(int argc, char** argv) {
     Options opts;
     const std::string problem = parse_args(argc, argv, opts);
     if (!problem.empty()) {
-        std::cerr << "error: " << problem << "\n"
-                  << "usage: emberdb [--config FILE] [--port N] [--bind ADDR]\n"
-                     "               [--requirepass-file FILE | --requirepass PASSWORD]\n"
-                     "               [--protected-mode yes|no] [--aof PATH]\n"
-                     "               [--fsync always|everysec|no] [--aof-rewrite-min-bytes N]\n"
-                     "               [--replicaof HOST:PORT] [--masterauth PASSWORD]\n"
-                     "               [--maxmemory SIZE] [--maxmemory-policy noeviction|allkeys-lru]\n"
-                     "  Put --config first: options after it override the file.\n";
+        std::cerr
+            << "error: " << problem << "\n"
+            << "usage: emberdb [--config FILE] [--port N] [--bind ADDR]\n"
+               "               [--requirepass-file FILE | --requirepass PASSWORD]\n"
+               "               [--protected-mode yes|no] [--aof PATH]\n"
+               "               [--metrics-port N] [--metrics-bind ADDR]\n"
+               "               [--fsync always|everysec|no] [--aof-rewrite-min-bytes N]\n"
+               "               [--replicaof HOST:PORT] [--masterauth PASSWORD]\n"
+               "               [--maxmemory SIZE] [--maxmemory-policy noeviction|allkeys-lru]\n"
+               "  Put --config first: options after it override the file.\n";
         return 1;
     }
 
@@ -234,6 +246,12 @@ int main(int argc, char** argv) {
     if (exposed && !opts.password.empty()) {
         std::cerr << "warning: traffic, including the password, is not encrypted; use a private "
                      "network, a VPN or a TLS proxy\n";
+    }
+
+    if (opts.metrics_port != 0 && !emberdb::is_loopback_address(opts.metrics_bind)) {
+        std::cerr << "warning: the metrics endpoint on " << opts.metrics_bind << ":"
+                  << opts.metrics_port
+                  << " has no authentication or encryption; keep it on a private network\n";
     }
 
     std::signal(SIGPIPE, SIG_IGN);
@@ -267,6 +285,11 @@ int main(int argc, char** argv) {
         emberdb::Server server(store, opts.port, aof.get(), opts.bind_address);
         server.set_password(opts.password);
         server.set_leader_password(opts.leader_password);
+        if (opts.metrics_port != 0) {
+            server.enable_metrics(opts.metrics_bind, opts.metrics_port);
+            std::cout << "metrics: http://" << opts.metrics_bind << ":" << server.metrics_port()
+                      << "/metrics" << std::endl;
+        }
         g_server = &server;
 
         if (!opts.leader_host.empty()) {
@@ -277,7 +300,7 @@ int main(int argc, char** argv) {
             std::cout << "following " << opts.leader_host << ":" << opts.leader_port << std::endl;
         }
 
-        struct sigaction sa{};
+        struct sigaction sa {};
         sa.sa_handler = on_signal;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, nullptr);

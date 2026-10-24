@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "emberdb/resp_parser.hpp"
 #include "emberdb/store.hpp"
@@ -13,5 +14,8 @@ namespace emberdb {
 // With `read_only` set, write commands are refused (used for clients of a follower).
 std::string execute(Store& store, const Command& command, Command* propagate = nullptr,
                     bool read_only = false);
+
+// Every command name the dispatcher understands (uppercase, sorted).
+std::vector<std::string> command_names();
 
 }  // namespace emberdb

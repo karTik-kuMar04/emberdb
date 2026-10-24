@@ -257,4 +257,14 @@ std::string execute(Store& store, const Command& command, Command* propagate, bo
     return reply;
 }
 
-}  // namespace emberdb
+  // namespace emberdb
+std::vector<std::string> command_names() {
+    std::vector<std::string> names;
+    for (const auto& entry : command_table()) {
+        names.emplace_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+}
