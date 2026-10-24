@@ -89,6 +89,7 @@ Store::Entry* Store::find_live(const std::string& key, std::int64_t now) {
         if (passive_expiry_) {
             return nullptr;  // follower: hide the key, but wait for the leader's DEL
         }
+        ++expired_keys_;
         erase_entry(it, true);  // lazy expiry: the deadline passed, so the key is gone
         return nullptr;
     }
@@ -117,6 +118,9 @@ bool Store::del(const std::string& key) {
     }
     const bool expired =
         !loading_ && !passive_expiry_ && it->second.expire_at && *it->second.expire_at <= clock_();
+    if (expired) {
+        ++expired_keys_;
+    }
     erase_entry(it, expired);  // an expired key is announced, a normal delete is not
     return !expired;
 }
@@ -197,6 +201,7 @@ std::size_t Store::purge_expired(std::size_t max_keys) {
         }
         erase_entry(it, true);
         ++removed;
+        ++expired_keys_;
     }
     return removed;
 }

@@ -1,3 +1,6 @@
+#include "emberdb/dispatcher.hpp"
+#include "prom_check.hpp"
+#include <vector>
 #include "emberdb/resp_writer.hpp"
 #include <filesystem>
 #include <arpa/inet.h>
@@ -781,4 +784,321 @@ TEST_F(ReplicationAuthTest, FollowerWithTheWrongPasswordIsRefused) {
     emberdb::Socket l = login(leader_->port(), "lead-pw");
     ASSERT_TRUE(l.valid());
     EXPECT_TRUE(contains(call(l.fd(), {"INFO"}), "connected_slaves:0"));
+}
+
+namespace {
+
+// A server running on its own thread, with its own store.
+class Node {
+public:
+    Node() : server_(store_, 0) {}
+    Node(const Node&) = delete;
+    Node& operator=(const Node&) = delete;
+    ~Node() { stop(); }
+
+    emberdb::Store& store() { return store_; }
+    emberdb::Server& server() { return server_; }
+    void start() { thread_ = std::thread([this] { server_.run(); }); }
+    void stop() {
+        if (thread_.joinable()) {
+            server_.stop();
+            thread_.join();
+        }
+    }
+
+private:
+    emberdb::Store store_;
+    emberdb::Server server_;
+    std::thread thread_;
+};
+
+std::string http_exchange(std::uint16_t port, const std::string& request) {
+    emberdb::Socket c(dial(port));
+    if (!c.valid()) {
+        return "";
+    }
+    send_all(c.fd(), request);
+    return recv_until_eof(c.fd());
+}
+
+std::string http_get(std::uint16_t port, const std::string& path) {
+    return http_exchange(port, "GET " + path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+}
+
+std::string body_of(const std::string& response) {
+    const std::size_t pos = response.find("\r\n\r\n");
+    return pos == std::string::npos ? std::string() : response.substr(pos + 4);
+}
+
+// The value of one series in a scrape, or -1 if it is not there.
+double metric_value(const std::string& body, const std::string& series) {
+    const std::string prefix = series + " ";
+    std::istringstream in(body);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.starts_with(prefix)) {
+            return std::strtod(line.c_str() + prefix.size(), nullptr);
+        }
+    }
+    return -1.0;
+}
+
+std::string scrape(std::uint16_t metrics_port) {
+    return body_of(http_get(metrics_port, "/metrics"));
+}
+
+}  // namespace
+
+TEST(MetricsEndpoint, ServesHealthAndMetrics) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t port = n.server().metrics_port();
+
+    const std::string health = http_get(port, "/healthz");
+    EXPECT_TRUE(health.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_EQ(body_of(health), "ok\n");
+    EXPECT_TRUE(http_get(port, "/readyz").starts_with("HTTP/1.1 200 OK\r\n"));
+
+    const std::string response = http_get(port, "/metrics");
+    EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(contains(response, "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+    const std::string body = body_of(response);
+    EXPECT_TRUE(contains(response, "Content-Length: " + std::to_string(body.size()) + "\r\n"));
+    EXPECT_EQ(check_exposition(body), "");
+    EXPECT_EQ(metric_value(body, "emberdb_build_info{version=\"" + std::string(emberdb::kVersion) + "\"}"), 1.0);
+    EXPECT_EQ(metric_value(body, "emberdb_metrics_scrapes_total"), 1.0);
+}
+
+TEST(MetricsEndpoint, CountsCommandsByName) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    EXPECT_EQ(ask(n.server().port(), {"SET", "a", "1"}), "+OK\r\n");
+    EXPECT_EQ(ask(n.server().port(), {"GET", "a"}), "$1\r\n1\r\n");
+    EXPECT_EQ(ask(n.server().port(), {"GET", "a"}), "$1\r\n1\r\n");
+    EXPECT_EQ(ask(n.server().port(), {"FOO"}), "-ERR unknown command 'FOO'\r\n");
+
+    const std::string body = scrape(n.server().metrics_port());
+    EXPECT_EQ(check_exposition(body), "");
+    EXPECT_EQ(metric_value(body, "emberdb_commands_processed_total{command=\"SET\"}"), 1.0);
+    EXPECT_EQ(metric_value(body, "emberdb_commands_processed_total{command=\"GET\"}"), 2.0);
+    EXPECT_EQ(metric_value(body, "emberdb_commands_processed_total{command=\"other\"}"), 1.0);
+    EXPECT_EQ(metric_value(body, "emberdb_command_errors_total"), 1.0);
+    EXPECT_EQ(metric_value(body, "emberdb_connections_accepted_total"), 4.0);
+    EXPECT_EQ(metric_value(body, "emberdb_command_duration_seconds_count"), 4.0);
+    EXPECT_EQ(metric_value(body, "emberdb_keys"), 1.0);
+    EXPECT_GT(metric_value(body, "emberdb_network_read_bytes_total"), 0.0);
+    EXPECT_GT(metric_value(body, "emberdb_network_written_bytes_total"), 0.0);
+    EXPECT_GT(metric_value(body, "emberdb_event_loop_busy_seconds_total"), 0.0);
+}
+
+TEST(MetricsEndpoint, EveryKnownCommandHasItsOwnSeries) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::string body = scrape(n.server().metrics_port());
+    std::vector<std::string> names = emberdb::command_names();
+    for (const char* extra : {"AUTH", "SYNC", "REPLICAOF", "INFO", "REWRITEAOF"}) {
+        names.emplace_back(extra);
+    }
+    for (const std::string& name : names) {
+        EXPECT_GE(metric_value(body, "emberdb_commands_processed_total{command=\"" + name + "\"}"),
+                  0.0)
+            << name;
+    }
+}
+
+TEST(MetricsEndpoint, UnknownCommandsDoNotCreateSeries) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::string before = scrape(n.server().metrics_port());
+
+    emberdb::Socket c(dial(n.server().port()));
+    ASSERT_TRUE(c.valid());
+    for (int i = 0; i < 50; ++i) {
+        call(c.fd(), {"JUNKCOMMAND" + std::to_string(i)});
+    }
+    const std::string after = scrape(n.server().metrics_port());
+    EXPECT_FALSE(contains(after, "JUNKCOMMAND"));
+    EXPECT_EQ(metric_value(after, "emberdb_commands_processed_total{command=\"other\"}"), 50.0);
+    EXPECT_EQ(metric_value(after, "emberdb_command_errors_total"), 50.0);
+    const auto count_series = [](const std::string& text) {
+        std::size_t lines = 0;
+        std::istringstream in(text);
+        std::string line;
+        while (std::getline(in, line)) {
+            lines += line.starts_with("emberdb_commands_processed_total{") ? 1 : 0;
+        }
+        return lines;
+    };
+    EXPECT_EQ(count_series(before), count_series(after));
+}
+
+TEST(MetricsEndpoint, LatencyHistogramCountsEveryCommand) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    emberdb::Socket c(dial(n.server().port()));
+    ASSERT_TRUE(c.valid());
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(call(c.fd(), {"PING"}), "+PONG\r\n");
+    }
+    const std::string body = scrape(n.server().metrics_port());
+    EXPECT_EQ(check_exposition(body), "");  // buckets are cumulative and match _count
+    EXPECT_EQ(metric_value(body, "emberdb_command_duration_seconds_count"), 10.0);
+    EXPECT_EQ(metric_value(body, "emberdb_command_duration_seconds_bucket{le=\"+Inf\"}"), 10.0);
+    EXPECT_EQ(metric_value(body, "emberdb_commands_processed_total{command=\"PING\"}"), 10.0);
+}
+
+TEST(MetricsEndpoint, AnswersErrorsAndIgnoresQueryStrings) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t port = n.server().metrics_port();
+
+    EXPECT_TRUE(http_get(port, "/nope").starts_with("HTTP/1.1 404 Not Found\r\n"));
+    EXPECT_TRUE(http_get(port, "/healthz?probe=1").starts_with("HTTP/1.1 200 OK\r\n"));
+    EXPECT_TRUE(http_get(port, "/metrics?x=1").starts_with("HTTP/1.1 200 OK\r\n"));
+
+    const std::string post = http_exchange(port, "POST /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    EXPECT_TRUE(post.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+    EXPECT_TRUE(contains(post, "Allow: GET\r\n"));
+
+    EXPECT_TRUE(http_exchange(port, "garbage\r\n\r\n").starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    EXPECT_TRUE(http_exchange(port, "GET /metrics HTTP/1.1\r\nX-Pad: " + std::string(9000, 'a'))
+                    .starts_with("HTTP/1.1 431 "));
+}
+
+TEST(MetricsEndpoint, SlowHttpClientsAreCutOff) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.server().set_http_timeout(std::chrono::milliseconds(300));
+    n.start();
+    emberdb::Socket slow(dial(n.server().metrics_port()));
+    ASSERT_TRUE(slow.valid());
+    send_all(slow.fd(), "GET /metrics HTT");  // never finishes its request
+    char byte = 0;
+    EXPECT_EQ(::recv(slow.fd(), &byte, 1, 0), 0);  // the server hung up on it
+    EXPECT_EQ(ask(n.server().port(), {"PING"}), "+PONG\r\n");  // and the database never noticed
+}
+
+TEST(MetricsEndpoint, TooManyHttpConnectionsAreRefused) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t port = n.server().metrics_port();
+
+    std::vector<emberdb::Socket> idle;
+    for (int i = 0; i < 16; ++i) {
+        idle.push_back(emberdb::Socket(dial(port)));
+        ASSERT_TRUE(idle.back().valid());
+    }
+    emberdb::Socket extra(dial(port));
+    ASSERT_TRUE(extra.valid());
+    char byte = 0;
+    EXPECT_EQ(::recv(extra.fd(), &byte, 1, 0), 0);  // the 17th is closed straight away
+
+    idle.pop_back();  // free one slot
+    EXPECT_TRUE(eventually([&] { return http_get(port, "/healthz").starts_with("HTTP/1.1 200"); }));
+    EXPECT_EQ(ask(n.server().port(), {"PING"}), "+PONG\r\n");
+}
+
+TEST(MetricsEndpoint, ReportsAuthActivityAndNeedsNoPassword) {
+    Node n;
+    n.server().set_password("s3cret");
+    n.server().set_auth_timeout(std::chrono::milliseconds(300));
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t mport = n.server().metrics_port();
+
+    emberdb::Socket c(dial(n.server().port()));
+    ASSERT_TRUE(c.valid());
+    EXPECT_EQ(call(c.fd(), {"AUTH", "wrong"}), kWrongPass);
+    EXPECT_EQ(call(c.fd(), {"AUTH", "s3cret"}), "+OK\r\n");  // this one logs in, so it survives
+    emberdb::Socket idle(dial(n.server().port()));            // this one never does
+    ASSERT_TRUE(idle.valid());
+
+    ASSERT_TRUE(eventually([&] {
+        return metric_value(scrape(mport), "emberdb_connections_dropped_total{reason=\"auth_timeout\"}") == 1.0;
+    }));
+    const std::string body = scrape(mport);  // no password was needed for any of these
+    EXPECT_EQ(metric_value(body, "emberdb_auth_required"), 1.0);
+    EXPECT_EQ(metric_value(body, "emberdb_auth_failures_total"), 1.0);
+    EXPECT_EQ(call(c.fd(), {"PING"}), "+PONG\r\n");
+}
+
+TEST(MetricsEndpoint, CountsExpiredAndEvictedKeys) {
+    Node n;
+    n.store().set_maxmemory(3000);
+    n.store().set_eviction_policy(emberdb::EvictionPolicy::kAllKeysLru);
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t mport = n.server().metrics_port();
+
+    EXPECT_EQ(ask(n.server().port(), {"SET", "ttl", "v"}), "+OK\r\n");
+    EXPECT_EQ(ask(n.server().port(), {"PEXPIRE", "ttl", "50"}), ":1\r\n");
+    ASSERT_TRUE(eventually([&] { return metric_value(scrape(mport), "emberdb_keys_expired_total") == 1.0; }));
+
+    const std::string big(1000, 'x');
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(ask(n.server().port(), {"SET", "k" + std::to_string(i), big}), "+OK\r\n");
+    }
+    const std::string body = scrape(mport);
+    EXPECT_GT(metric_value(body, "emberdb_keys_evicted_total"), 0.0);
+    EXPECT_EQ(metric_value(body, "emberdb_memory_limit_bytes"), 3000.0);
+    EXPECT_GT(metric_value(body, "emberdb_memory_used_bytes"), 0.0);
+}
+
+TEST(MetricsEndpoint, ReportsReplication) {
+    Node leader;
+    Node follower;
+    leader.server().enable_metrics("127.0.0.1", 0);
+    follower.server().enable_metrics("127.0.0.1", 0);
+    leader.start();
+    follower.start();
+    const std::uint16_t lm = leader.server().metrics_port();
+    const std::uint16_t fm = follower.server().metrics_port();
+
+    EXPECT_EQ(metric_value(scrape(fm), "emberdb_replication_follower"), 0.0);
+    ASSERT_EQ(ask(follower.server().port(),
+                  {"REPLICAOF", "127.0.0.1", std::to_string(leader.server().port())}),
+              "+OK\r\n");
+    ASSERT_TRUE(eventually([&] { return metric_value(scrape(fm), "emberdb_replication_link_up") == 1.0; }));
+    EXPECT_TRUE(http_get(fm, "/readyz").starts_with("HTTP/1.1 200 OK\r\n"));
+
+    EXPECT_EQ(ask(leader.server().port(), {"SET", "a", "1"}), "+OK\r\n");
+    ASSERT_TRUE(eventually([&] {
+        return metric_value(scrape(fm), "emberdb_replication_commands_applied_total") >= 2.0;
+    }));  // the FLUSHALL that starts every sync, plus the SET
+
+    const std::string lbody = scrape(lm);
+    EXPECT_EQ(metric_value(lbody, "emberdb_replication_connected_followers"), 1.0);
+    EXPECT_EQ(metric_value(lbody, "emberdb_replication_full_syncs_sent_total"), 1.0);
+    EXPECT_EQ(metric_value(scrape(fm), "emberdb_replication_follower"), 1.0);
+}
+
+TEST(MetricsEndpoint, FollowerIsNotReadyWithoutALeader) {
+    Node n;
+    n.server().enable_metrics("127.0.0.1", 0);
+    n.start();
+    const std::uint16_t mport = n.server().metrics_port();
+
+    EXPECT_EQ(ask(n.server().port(), {"REPLICAOF", "127.0.0.1", "1"}), "+OK\r\n");  // nobody listens there
+    EXPECT_TRUE(http_get(mport, "/readyz").starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    EXPECT_TRUE(http_get(mport, "/healthz").starts_with("HTTP/1.1 200 OK\r\n"));  // alive, just not ready
+
+    EXPECT_EQ(ask(n.server().port(), {"REPLICAOF", "NO", "ONE"}), "+OK\r\n");
+    EXPECT_TRUE(eventually([&] { return http_get(mport, "/readyz").starts_with("HTTP/1.1 200 OK"); }));
+}
+
+TEST(MetricsEndpoint, EnableMetricsValidatesItsArguments) {
+    emberdb::Store store;
+    emberdb::Server server(store, 0);
+    EXPECT_THROW(server.enable_metrics("not-an-ip", 0), std::runtime_error);
+    EXPECT_THROW(server.enable_metrics("127.0.0.1", server.port()), std::runtime_error);  // taken
+    server.enable_metrics("127.0.0.1", 0);
+    EXPECT_NE(server.metrics_port(), 0);
+    EXPECT_THROW(server.enable_metrics("127.0.0.1", 0), std::runtime_error);  // only once
 }

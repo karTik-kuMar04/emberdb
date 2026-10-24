@@ -513,3 +513,38 @@ TEST(ParseBytes, RejectsGarbageAndOverflow) {
     EXPECT_FALSE(parse_bytes("99999999999999999999").has_value());
     EXPECT_FALSE(parse_bytes("18446744073709551615k").has_value());
 }
+
+TEST(StoreCounters, ExpiredKeysAreCountedByEachPath) {
+    FakeClock clk;
+    emberdb::Store s(clk.fn());
+    s.set("lazy", "1");
+    s.expire_in("lazy", 10);
+    s.set("swept", "1");
+    s.expire_in("swept", 10);
+    s.set("deleted", "1");
+    s.expire_in("deleted", 10);
+    s.set("kept", "1");
+    clk.now += 10;
+    EXPECT_EQ(s.expired_keys(), 0U);
+    EXPECT_FALSE(s.exists("lazy"));  // found by a read
+    EXPECT_EQ(s.expired_keys(), 1U);
+    EXPECT_FALSE(s.del("deleted"));  // an already-expired key: the DEL finds it dead
+    EXPECT_EQ(s.expired_keys(), 2U);
+    EXPECT_EQ(s.purge_expired(10), 1U);  // found by the sweep
+    EXPECT_EQ(s.expired_keys(), 3U);
+    EXPECT_TRUE(s.exists("kept"));
+}
+
+TEST(StoreCounters, ExplicitDeletesAndEvictionsAreNotExpiries) {
+    emberdb::Store s;
+    s.set_eviction_policy(emberdb::EvictionPolicy::kAllKeysLru);
+    s.set("a", "1");
+    s.set("b", "1");
+    s.set("c", "1");
+    EXPECT_TRUE(s.del("a"));
+    EXPECT_EQ(s.expired_keys(), 0U);
+    s.set_maxmemory(s.used_memory() - 1);
+    EXPECT_TRUE(s.make_room());
+    EXPECT_EQ(s.evicted_keys(), 1U);
+    EXPECT_EQ(s.expired_keys(), 0U);  // evictions have their own counter
+}

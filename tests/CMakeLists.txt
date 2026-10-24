@@ -43,3 +43,11 @@ gtest_discover_tests(security_test)
 add_executable(config_test config_test.cpp)
 target_link_libraries(config_test PRIVATE emberdb_lib GTest::gtest_main)
 gtest_discover_tests(config_test)
+
+add_executable(metrics_test metrics_test.cpp)
+target_link_libraries(metrics_test PRIVATE emberdb_lib GTest::gtest_main)
+gtest_discover_tests(metrics_test)
+
+add_executable(http_test http_test.cpp)
+target_link_libraries(http_test PRIVATE emberdb_lib GTest::gtest_main)
+gtest_discover_tests(http_test)

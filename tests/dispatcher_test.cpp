@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include "emberdb/dispatcher.hpp"
@@ -266,4 +267,18 @@ TEST(DispatcherMemory, ReadOnlyErrorTakesPriorityOverOom) {
     s.set_maxmemory(1);
     EXPECT_EQ(execute(s, {"SET", "b", "1"}, nullptr, true),
               "-ERR You can't write against a read only replica.\r\n");
+}
+
+TEST(DispatcherNames, ListsEveryCommandOnceAndSorted) {
+    const auto names = emberdb::command_names();
+    EXPECT_TRUE(std::is_sorted(names.begin(), names.end()));
+    EXPECT_EQ(std::adjacent_find(names.begin(), names.end()), names.end());
+    for (const char* wanted : {"PING", "SET", "GET", "DEL", "EXPIRE", "INCR", "FLUSHALL"}) {
+        EXPECT_TRUE(std::binary_search(names.begin(), names.end(), std::string(wanted))) << wanted;
+    }
+    Store s;
+    for (const std::string& name : names) {
+        // Whatever else happens (wrong arguments, say), a listed name is never "unknown".
+        EXPECT_EQ(execute(s, {name}).find("unknown command"), std::string::npos) << name;
+    }
 }

@@ -15,6 +15,8 @@ add_library(emberdb_lib
     src/snapshot.cpp
     src/security.cpp
     src/config.cpp
+    src/metrics.cpp
+    src/http.cpp
 )
 target_include_directories(emberdb_lib PUBLIC include)
 target_compile_options(emberdb_lib PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion)

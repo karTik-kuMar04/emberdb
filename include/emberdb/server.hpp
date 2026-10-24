@@ -13,6 +13,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "emberdb/http.hpp"
+#include "emberdb/metrics.hpp"
 #include "emberdb/resp_parser.hpp"
 #include "emberdb/security.hpp"
 #include "emberdb/socket.hpp"
@@ -23,7 +25,7 @@ namespace emberdb {
 class Aof;
 
 // Single-threaded epoll event loop serving many clients (Linux only).
-// Can also follow another emberdb server (replication).
+// Can also follow another emberdb server (replication) and expose Prometheus metrics.
 class Server {
 public:
     // Pass port 0 to let the OS pick a free port (used by tests).
@@ -45,6 +47,13 @@ public:
     // How long a connection may stay unauthenticated (default 10 seconds).
     void set_auth_timeout(std::chrono::milliseconds timeout) noexcept { auth_timeout_ = timeout; }
 
+    // Starts an HTTP endpoint (/metrics, /healthz, /readyz) on its own port. Pass port 0 to let
+    // the OS pick one. Throws std::runtime_error on failure. Call once, before run().
+    void enable_metrics(const std::string& bind_address, std::uint16_t port);
+    [[nodiscard]] std::uint16_t metrics_port() const noexcept { return metrics_port_; }
+    // How long an HTTP client has to finish its request (default 5 seconds).
+    void set_http_timeout(std::chrono::milliseconds timeout) noexcept { http_timeout_ = timeout; }
+
     // Makes this server follow host:port (IPv4 address or "localhost"). Returns an error message,
     // or an empty string on success. The connection is made from inside run().
     // Call before run() or from the loop thread (the REPLICAOF command does the latter).
@@ -53,7 +62,7 @@ public:
     void stop_replication();
 
 private:
-    enum class Role { kClient, kFollower, kLeaderLink };
+    enum class Role { kClient, kFollower, kLeaderLink, kHttp };
     enum class LinkState { kDown, kConnecting, kWaiting, kStreaming };
 
     struct Connection {
@@ -71,22 +80,30 @@ private:
     };
 
     void accept_clients();
+    void accept_http_clients();
     void handle_event(int fd, std::uint32_t events);
+    void handle_http_event(int fd, Connection& c, std::uint32_t events);
     bool read_some(Connection& c);
+    bool read_http(Connection& c);
     bool process_input(Connection& c);
     bool flush(Connection& c);
     bool update_interest(int fd, Connection& c);
     void close_connection(int fd);
 
     std::string handle_command(Connection& c, const Command& cmd);
+    std::string dispatch_command(Connection& c, const Command& cmd, const std::string& name);
     void apply_from_leader(const Command& cmd);
     void propagate(const Command& effect);
     void flush_followers();
     void maybe_rewrite_aof();
-    void close_stale_unauthenticated();
+    void close_stale_connections();
+
+    std::string http_reply(const HttpRequest& request);
+    std::string render_metrics() const;
 
     // Commands that need server state, so the dispatcher can't run them.
-    std::optional<std::string> server_command(Connection& c, const Command& cmd);
+    std::optional<std::string> server_command(Connection& c, const Command& cmd,
+                                              const std::string& name);
     std::string cmd_auth(Connection& c, const Command& cmd);
     std::string try_authenticate(Connection& c, std::string_view password);
     std::string cmd_rewriteaof(const Command& cmd);
@@ -111,10 +128,17 @@ private:
     std::array<char, 16384> read_buf_{};
 
     Authenticator auth_;
-    std::size_t auth_failures_total_ = 0;
     std::chrono::milliseconds auth_timeout_{10000};
     std::chrono::steady_clock::time_point next_sweep_{};
     std::string leader_password_;
+
+    Metrics metrics_;
+    Socket metrics_listener_;
+    std::uint16_t metrics_port_ = 0;
+    std::size_t http_clients_ = 0;
+    std::chrono::milliseconds http_timeout_{5000};
+    std::chrono::steady_clock::time_point started_at_ = std::chrono::steady_clock::now();
+    std::int64_t started_unix_ = unix_now_ms() / 1000;
 
     std::vector<int> followers_;  // fds of connections that follow us
     std::vector<int> doomed_;     // fds to close at the end of the current loop pass
