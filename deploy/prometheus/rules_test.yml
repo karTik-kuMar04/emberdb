@@ -1,0 +1,62 @@
+rule_files:
+  - rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  - name: a saturated event loop alerts after five minutes
+    interval: 15s
+    input_series:
+      - series: 'emberdb_event_loop_busy_seconds_total{instance="a:9390"}'
+        values: "0+13.5x40"   # 13.5 busy seconds per 15 s, so 90% busy
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: EmberdbEventLoopSaturated
+        exp_alerts: []        # still pending
+      - eval_time: 10m
+        alertname: EmberdbEventLoopSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: "a:9390"
+            exp_annotations:
+              summary: "emberdb a:9390 event loop is over 80% busy"
+
+  - name: a moderately busy event loop does not alert
+    interval: 15s
+    input_series:
+      - series: 'emberdb_event_loop_busy_seconds_total{instance="a:9390"}'
+        values: "0+4.5x40"    # 30% busy
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EmberdbEventLoopSaturated
+        exp_alerts: []
+
+  - name: a follower that lost its leader alerts
+    interval: 15s
+    input_series:
+      - series: 'emberdb_replication_follower{instance="f:9390"}'
+        values: "1x40"
+      - series: 'emberdb_replication_link_up{instance="f:9390"}'
+        values: "0x40"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: EmberdbReplicationLinkDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: "f:9390"
+            exp_annotations:
+              summary: "emberdb f:9390 lost its leader"
+
+  - name: a healthy follower does not alert
+    interval: 15s
+    input_series:
+      - series: 'emberdb_replication_follower{instance="f:9390"}'
+        values: "1x40"
+      - series: 'emberdb_replication_link_up{instance="f:9390"}'
+        values: "1x40"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: EmberdbReplicationLinkDown
+        exp_alerts: []

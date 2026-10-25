@@ -5,3 +5,4 @@ compile_commands.json
 emberdb.conf
 *.pass
 *.aof
+secrets/

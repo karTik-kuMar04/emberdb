@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
@@ -11,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [debug, asan]
+        preset: [debug, asan, release]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -20,3 +24,74 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  deploy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The committed Grafana dashboard is up to date
+        run: |
+          python3 deploy/grafana/make_dashboard.py
+          git diff --exit-code deploy/grafana/dashboards
+      - name: Create demo secrets
+        run: scripts/make-secrets.sh
+      - name: The compose file is valid
+        run: docker compose config --quiet
+      - name: Prometheus config and alert rules are valid
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.55.1 check config /etc/prometheus/prometheus.yml
+      - name: Alert rules behave as intended
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.55.1 test rules /etc/prometheus/rules_test.yml
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: emberdb:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: scripts/smoke-test.sh emberdb:ci
+
+  publish-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-and-test, deploy-config, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name and tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha

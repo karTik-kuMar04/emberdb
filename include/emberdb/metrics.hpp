@@ -10,7 +10,7 @@
 
 namespace emberdb {
 
-inline constexpr const char* kVersion = "0.11.0";
+inline constexpr const char* kVersion = "0.12.0";
 
 // Upper bounds of the command latency histogram buckets, in nanoseconds.
 inline constexpr std::array<std::uint64_t, 18> kLatencyBoundsNs = {
