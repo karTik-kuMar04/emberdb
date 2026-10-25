@@ -1,0 +1,45 @@
+groups:
+  - name: emberdb
+    rules:
+      - alert: EmberdbDown
+        expr: up{job="emberdb"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} is not reachable by Prometheus"
+
+      # The event loop is one thread: near 100% busy, every client gets slower.
+      - alert: EmberdbEventLoopSaturated
+        expr: rate(emberdb_event_loop_busy_seconds_total[1m]) > 0.8
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} event loop is over 80% busy"
+
+      - alert: EmberdbReplicationLinkDown
+        expr: emberdb_replication_follower == 1 and emberdb_replication_link_up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} lost its leader"
+
+      # The filter in the denominator drops servers that have no limit configured.
+      - alert: EmberdbMemoryNearLimit
+        expr: emberdb_memory_used_bytes / (emberdb_memory_limit_bytes > 0) > 0.9
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} is using over 90% of its memory limit"
+
+      - alert: EmberdbAuthFailures
+        expr: increase(emberdb_auth_failures_total[5m]) > 20
+        labels: {severity: warning}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} saw over 20 wrong passwords in 5 minutes"
+
+      - alert: EmberdbSlowCommands
+        expr: histogram_quantile(0.99, sum by (le, instance) (rate(emberdb_command_duration_seconds_bucket[5m]))) > 0.005
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "emberdb {{ $labels.instance }} p99 command time is over 5 ms"

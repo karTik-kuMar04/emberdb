@@ -1,0 +1,105 @@
+name: emberdb
+
+# Settings shared by the leader and the follower.
+x-emberdb: &emberdb
+  build:
+    context: .
+    args:
+      VERSION: ${EMBERDB_VERSION:-local}
+  image: emberdb:local
+  restart: unless-stopped
+  read_only: true                      # the only writable place is the /data volume
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 64
+  mem_limit: 512m
+  stop_grace_period: 10s
+  secrets: [emberdb_password]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  leader:
+    <<: *emberdb
+    command:
+      - --requirepass-file
+      - /run/secrets/emberdb_password
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports: ["127.0.0.1:7380:6380"]
+    volumes: ["leader-data:/data"]
+    networks:
+      emberdb:
+        ipv4_address: 172.28.0.10
+
+  follower:
+    <<: *emberdb
+    command:
+      - --requirepass-file
+      - /run/secrets/emberdb_password
+      - --replicaof
+      - 172.28.0.10:6380
+      - --masterauth-file
+      - /run/secrets/emberdb_password
+    ports: ["127.0.0.1:7381:6380"]
+    volumes: ["follower-data:/data"]
+    depends_on:
+      leader:
+        condition: service_healthy
+    networks:
+      emberdb:
+        ipv4_address: 172.28.0.11
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    networks: [emberdb]
+    depends_on: [leader, follower]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    secrets: [grafana_password]
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+    networks: [emberdb]
+    depends_on: [prometheus]
+
+secrets:
+  emberdb_password:
+    file: ./secrets/emberdb_password
+  grafana_password:
+    file: ./secrets/grafana_password
+
+volumes:
+  leader-data:
+  follower-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  emberdb:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

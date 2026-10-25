@@ -1,0 +1,9 @@
+.git
+.github
+.devcontainer
+build
+tests
+secrets
+*.aof
+*.pass
+emberdb.conf

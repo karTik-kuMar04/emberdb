@@ -62,10 +62,36 @@ std::string read_small_file(const std::string& path) {
 }
 
 void warn_if_group_or_world_readable(const std::string& path, const char* what) {
+    // Container orchestrators mount secrets here and decide the permissions themselves.
+    if (path.starts_with("/run/secrets/")) {
+        return;
+    }
     struct stat st {};
     if (::stat(path.c_str(), &st) == 0 && (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         std::cerr << "warning: " << path << " holds " << what
                   << " but other users can read it; run: chmod 600 " << path << std::endl;
+    }
+}
+
+// Reads a password from the first line of a file. Returns an error message, or "".
+std::string read_password_file(const std::string& path, std::string& out) {
+    try {
+        std::string text = read_small_file(path);
+        const std::size_t newline = text.find('\n');
+        if (newline != std::string::npos) {
+            text.resize(newline);
+        }
+        while (!text.empty() && text.back() == '\r') {
+            text.pop_back();
+        }
+        if (text.empty()) {
+            return "the password file is empty";
+        }
+        warn_if_group_or_world_readable(path, "a password");
+        out = std::move(text);
+        return {};
+    } catch (const std::exception& e) {
+        return e.what();
     }
 }
 
@@ -78,14 +104,6 @@ std::string apply_option(Options& opts, std::string_view name, std::string_view 
             return "port must be a number from 1 to 65535";
         }
         opts.port = static_cast<std::uint16_t>(*port);
-    } else if (name == "metrics-port") {
-        const auto port = emberdb::parse_int64(value);
-        if (!port || *port < 1 || *port > 65535) {
-            return "metrics-port must be a number from 1 to 65535";
-        }
-        opts.metrics_port = static_cast<std::uint16_t>(*port);
-    } else if (name == "metrics-bind") {
-        opts.metrics_bind = std::string(value);
     } else if (name == "bind") {
         opts.bind_address = std::string(value);
     } else if (name == "aof") {
@@ -128,26 +146,19 @@ std::string apply_option(Options& opts, std::string_view name, std::string_view 
     } else if (name == "requirepass") {
         opts.password = std::string(value);
     } else if (name == "requirepass-file") {
-        const std::string path(value);
-        try {
-            std::string text = read_small_file(path);
-            const std::size_t newline = text.find('\n');
-            if (newline != std::string::npos) {
-                text.resize(newline);
-            }
-            while (!text.empty() && text.back() == '\r') {
-                text.pop_back();
-            }
-            if (text.empty()) {
-                return "the password file is empty";
-            }
-            warn_if_group_or_world_readable(path, "a password");
-            opts.password = std::move(text);
-        } catch (const std::exception& e) {
-            return e.what();
-        }
+        return read_password_file(std::string(value), opts.password);
     } else if (name == "masterauth") {
         opts.leader_password = std::string(value);
+    } else if (name == "masterauth-file") {
+        return read_password_file(std::string(value), opts.leader_password);
+    } else if (name == "metrics-port") {
+        const auto port = emberdb::parse_int64(value);
+        if (!port || *port < 1 || *port > 65535) {
+            return "metrics-port must be a number from 1 to 65535";
+        }
+        opts.metrics_port = static_cast<std::uint16_t>(*port);
+    } else if (name == "metrics-bind") {
+        opts.metrics_bind = std::string(value);
     } else if (name == "protected-mode") {
         if (value == "yes") {
             opts.protected_mode = true;
@@ -200,8 +211,8 @@ std::string parse_args(int argc, char** argv, Options& opts) {
         }
         const std::string_view name = flag.substr(2);
         char* value_arg = argv[++i];
-        const std::string error =
-            name == "config" ? load_config(opts, value_arg) : apply_option(opts, name, value_arg);
+        const std::string error = name == "config" ? load_config(opts, value_arg)
+                                                   : apply_option(opts, name, value_arg);
         if (!error.empty()) {
             return "--" + std::string(name) + ": " + error;
         }
@@ -219,16 +230,15 @@ int main(int argc, char** argv) {
     Options opts;
     const std::string problem = parse_args(argc, argv, opts);
     if (!problem.empty()) {
-        std::cerr
-            << "error: " << problem << "\n"
-            << "usage: emberdb [--config FILE] [--port N] [--bind ADDR]\n"
-               "               [--requirepass-file FILE | --requirepass PASSWORD]\n"
-               "               [--protected-mode yes|no] [--aof PATH]\n"
-               "               [--metrics-port N] [--metrics-bind ADDR]\n"
-               "               [--fsync always|everysec|no] [--aof-rewrite-min-bytes N]\n"
-               "               [--replicaof HOST:PORT] [--masterauth PASSWORD]\n"
-               "               [--maxmemory SIZE] [--maxmemory-policy noeviction|allkeys-lru]\n"
-               "  Put --config first: options after it override the file.\n";
+        std::cerr << "error: " << problem << "\n"
+                  << "usage: emberdb [--config FILE] [--port N] [--bind ADDR]\n"
+                     "               [--requirepass-file FILE | --requirepass PASSWORD]\n"
+                     "               [--protected-mode yes|no] [--aof PATH]\n"
+                     "               [--metrics-port N] [--metrics-bind ADDR]\n"
+                     "               [--fsync always|everysec|no] [--aof-rewrite-min-bytes N]\n"
+                     "               [--replicaof HOST:PORT] [--masterauth-file FILE]\n"
+                     "               [--maxmemory SIZE] [--maxmemory-policy noeviction|allkeys-lru]\n"
+                     "  Put --config first: options after it override the file.\n";
         return 1;
     }
 
@@ -247,7 +257,6 @@ int main(int argc, char** argv) {
         std::cerr << "warning: traffic, including the password, is not encrypted; use a private "
                      "network, a VPN or a TLS proxy\n";
     }
-
     if (opts.metrics_port != 0 && !emberdb::is_loopback_address(opts.metrics_bind)) {
         std::cerr << "warning: the metrics endpoint on " << opts.metrics_bind << ":"
                   << opts.metrics_port
@@ -300,7 +309,7 @@ int main(int argc, char** argv) {
             std::cout << "following " << opts.leader_host << ":" << opts.leader_port << std::endl;
         }
 
-        struct sigaction sa {};
+        struct sigaction sa{};
         sa.sa_handler = on_signal;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, nullptr);
